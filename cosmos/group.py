@@ -395,6 +395,13 @@ def supergaussian_grouping(
         "Time": Time,
 
         "Dif": Dif,
+        # --------------------------------------------------------
+        # COSMOS positional regularization graph
+        # --------------------------------------------------------
+
+        "first_edge": first_edge,
+        "adj_vertices": adj_vertices,
+        "edge_weights": edge_weights,
     }
 
 def build_supergaussians(
@@ -423,7 +430,7 @@ def build_supergaussians(
     sh_dc = gaussians.get_features[:, 0, :]
     color = SH2RGB(sh_dc)
 
-    scale = gaussians.get_scaling()
+    scale = gaussians.get_scaling
 
     # ============================================================
     # 2. KNN

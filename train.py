@@ -22,6 +22,20 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from cosmos.group import build_supergaussians
+from utils.sh_utils import SH2RGB
+import torch.nn.functional as F
+
+from cosmos.attention import (
+    PositionalEncoding3D,
+    SuperGaussianSelfAttention,
+    SparseLocalAttention,
+)
+from cosmos.losses import (
+    compute_D_avg,
+    compute_D_ctr,
+)
+
+from cosmos.heads import ResidualMLP
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -55,34 +69,46 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # COSMOS — SUPERGAUSSIAN GROUPING
     # ============================================================
 
-    print("=" * 70)
-    print("COSMOS SUPERGAUSSIAN GROUPING")
-    print("=" * 70)
+    # print("=" * 70)
+    # print("COSMOS SUPERGAUSSIAN GROUPING")
+    # print("=" * 70)
 
-    groups = build_supergaussians(gaussians)
+    # groups = build_supergaussians(gaussians)
 
-    gaussians.supergaussian_ids = groups["supergaussian_ids"]
+    # gaussians.supergaussian_ids = groups["supergaussian_ids"]
 
-    print("Gaussians      :", gaussians.get_xyz.shape[0])
-    print(
-        "SuperGaussians :",
-        torch.unique(gaussians.supergaussian_ids).numel()
-    )
-    print(
-        "Feature dim    :",
-        groups["features"].shape[1]
-    )
+    # print("Gaussians      :", gaussians.get_xyz.shape[0])
+    # print(
+    #     "SuperGaussians :",
+    #     torch.unique(gaussians.supergaussian_ids).numel()
+    # )
+    # print(
+    #     "Feature dim    :",
+    #     groups["features"].shape[1]
+    # )
 
-    assert gaussians.supergaussian_ids.shape[0] == \
-        gaussians.get_xyz.shape[0]
+    # assert gaussians.supergaussian_ids.shape[0] == \
+    #     gaussians.get_xyz.shape[0]
 
-    print("=" * 70)
+    # print("=" * 70)
 
 
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+        # ============================================================
+    # COSMOS — ITERATION 100 INITIALIZATION
+    # ============================================================
+
+
+    global_attention = None
+    local_attention = None
+
+    cosmos_first_edge = None
+    cosmos_adj_vertices = None
+    cosmos_edge_weights = None
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -98,9 +124,463 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
 
+    # ============================================================
+    # COSMOS STATE
+    # ============================================================
+
+    cosmos_initialized = False
+
+    groups = None
+
+    global_model = None
+    local_model = None
+
+    position_head = None
+    orientation_head = None
+    scale_head = None
+    color_head = None
+    opacity_head = None
+    cosmos_optimizer = None
+
+    neighbor_indices = None
+    group_centers = None
+    local_pos_encoder = None
+
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    cosmos_initialized = False
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
+                # ========================================================
+        # COSMOS — INITIALIZE AT ITERATION 100
+        # ========================================================
+
+        if iteration == 100 and not cosmos_initialized:
+
+            print("=" * 70)
+            print("COSMOS INITIALIZATION — ITERATION 100")
+            print("=" * 70)
+
+            # ----------------------------------------------------
+            # Build SuperGaussian grouping
+            # ----------------------------------------------------
+
+            groups = build_supergaussians(gaussians)
+
+            gaussians.supergaussian_ids = (
+                groups["supergaussian_ids"]
+            )
+
+            cosmos_first_edge = groups["first_edge"]
+            cosmos_adj_vertices = groups["adj_vertices"]
+            cosmos_edge_weights = groups["edge_weights"]
+            cosmos_knn_indices = groups["knn_indices"]
+
+            group_centers = groups["group_centers"]
+
+            # ----------------------------------------------------
+            # Feature dimensions
+            # ----------------------------------------------------
+
+            remaining_dim = (
+                groups["features"].shape[1] - 3
+            )
+
+            pos_dim = 3 + 2 * 6 * 3
+            # xyz + sin/cos positional encoding
+            # with 6 frequencies
+
+            # ----------------------------------------------------
+            # Global SuperGaussian attention
+            # ----------------------------------------------------
+
+            global_attention = SuperGaussianSelfAttention(
+                remaining_dim=remaining_dim,
+                pos_dim=pos_dim,
+                d_model=128,
+                num_heads=4,
+                num_freqs=6
+            ).cuda()
+
+            # ----------------------------------------------------
+            # Local Gaussian attention
+            # ----------------------------------------------------
+
+            local_attention = SparseLocalAttention(
+                input_dim=49,
+                embed_dim=128,
+                num_heads=4
+            ).cuda()
+
+            cosmos_initialized = True
+
+            print(
+                "Gaussians:",
+                gaussians.get_xyz.shape[0]
+            )
+
+            print(
+                "SuperGaussians:",
+                torch.unique(
+                    gaussians.supergaussian_ids
+                ).numel()
+            )
+
+            print(
+                "Global attention initialized"
+            )
+
+            print(
+                "Local attention initialized"
+            )
+
+            print("=" * 70)
+
+            # ----------------------------------------------------
+            # Build COSMOS features for current Gaussian state
+            # ----------------------------------------------------
+
+            # ----------------------------------------------------
+            # COSMOS residual prediction heads
+            # ----------------------------------------------------
+
+            unified_dim = 128 + 128  # global + local
+
+            position_head = ResidualMLP(
+                input_dim=unified_dim,
+                output_dim=3
+            ).cuda()
+
+            orientation_head = ResidualMLP(
+                input_dim=unified_dim,
+                output_dim=4
+            ).cuda()
+
+            scale_head = ResidualMLP(
+                input_dim=unified_dim,
+                output_dim=3
+            ).cuda()
+
+            color_head = ResidualMLP(
+                input_dim=unified_dim,
+                output_dim=3
+            ).cuda()
+
+            opacity_head = ResidualMLP(
+                input_dim=unified_dim,
+                output_dim=1
+            ).cuda()
+
+            # ----------------------------------------------------
+            # COSMOS optimizer
+            # ----------------------------------------------------
+
+            cosmos_optimizer = torch.optim.Adam(
+                list(global_attention.parameters())
+                + list(local_attention.parameters())
+                + list(position_head.parameters())
+                + list(orientation_head.parameters())
+                + list(scale_head.parameters())
+                + list(color_head.parameters())
+                + list(opacity_head.parameters()),
+                lr=1e-4
+            )
+
+            print("Residual heads initialized.")
+            print("Unified feature dimension:", unified_dim)
+
+            xyz = gaussians.get_xyz
+
+            sh_dc = gaussians.get_features[:, 0, :]
+            color = SH2RGB(sh_dc)
+
+            scale = gaussians.get_scaling
+
+            descriptors = groups["features"][:, 9:13]
+
+            gaussian_features = torch.cat(
+                [
+                    xyz,
+                    color,
+                    scale,
+                    descriptors
+                ],
+                dim=1
+            )
+
+            # ----------------------------------------------------
+            # Group-wise max pooling
+            # ----------------------------------------------------
+
+            supergaussian_ids = (
+                gaussians.supergaussian_ids
+            )
+
+            unique_ids = torch.unique(
+                supergaussian_ids
+            )
+
+            group_features = []
+
+            for group_id in unique_ids:
+
+                mask = (
+                    supergaussian_ids == group_id
+                )
+
+                group_features.append(
+                    gaussian_features[mask].max(
+                        dim=0
+                    ).values
+                )
+
+            group_features = torch.stack(
+                group_features,
+                dim=0
+            )
+
+            # ----------------------------------------------------
+            # Separate position from remaining attributes
+            # ----------------------------------------------------
+
+            group_remaining = group_features[:, 3:]
+
+            # ----------------------------------------------------
+            # Global SuperGaussian attention
+            # ----------------------------------------------------
+
+            global_features, global_attention_weights = (
+                global_attention(
+                    group_centers,
+                    group_remaining
+                )
+            )
+            # ============================================================
+            # COSMOS — GLOBAL SELF-ATTENTION VALIDATION
+            # ============================================================
+
+            print("=" * 70)
+            print("GLOBAL SELF-ATTENTION VALIDATION")
+            print("=" * 70)
+
+            print("Input group centers :", group_centers.shape)
+            print("Input group features:", group_remaining.shape)
+            print("Output features     :", global_features.shape)
+            print("Attention shape     :", global_attention_weights.shape)
+
+            print(
+                "Output finite:",
+                torch.isfinite(global_features).all().item()
+            )
+
+            print(
+                "Attention finite:",
+                torch.isfinite(global_attention_weights).all().item()
+            )
+
+            # Each attention distribution should sum to 1
+            attention_row_sums = (
+                global_attention_weights.sum(dim=-1)
+            )
+
+            print(
+                "Attention row sum min/max:",
+                attention_row_sums.min().item(),
+                attention_row_sums.max().item()
+            )
+
+            print(
+                "Global feature mean/std:",
+                global_features.mean().item(),
+                global_features.std().item()
+            )
+
+            print("=" * 70)
+            # ----------------------------------------------------
+            # Broadcast global features to Gaussians
+            # ----------------------------------------------------
+
+            global_gaussian_features = (
+                global_features[
+                    supergaussian_ids
+                ]
+            )
+
+            # ----------------------------------------------------
+            # Local Gaussian features
+            # ----------------------------------------------------
+
+            local_pos = PositionalEncoding3D(
+                num_freqs=6
+            ).cuda()(xyz)
+
+            local_features = torch.cat(
+                [
+                    local_pos,
+                    gaussian_features[:, 3:]
+                ],
+                dim=1
+            )
+
+            # ----------------------------------------------------
+            # Local sparse attention
+            # ----------------------------------------------------
+
+            local_features_out, local_attention_weights = (
+                local_attention(
+                    local_features,
+                    cosmos_knn_indices
+                )
+            )
+
+            # ----------------------------------------------------
+            # Unified COSMOS representation
+            # ----------------------------------------------------
+
+            unified_features = torch.cat(
+                [
+                    global_gaussian_features,
+                    local_features_out
+                ],
+                dim=1
+            )
+
+            # ============================================================
+            # COSMOS — PREDICT GAUSSIAN RESIDUALS
+            # ============================================================
+
+            delta_position = position_head(
+                unified_features
+            )
+
+            delta_rotation = orientation_head(
+                unified_features
+            )
+
+            delta_scale = scale_head(
+                unified_features
+            )
+
+            delta_color = color_head(
+                unified_features
+            )
+
+            delta_opacity = opacity_head(
+                unified_features
+            )
+
+            print("Residual shapes:")
+            print("  Δposition :", delta_position.shape)
+            print("  Δrotation :", delta_rotation.shape)
+            print("  Δscale    :", delta_scale.shape)
+            print("  Δcolor    :", delta_color.shape)
+            print("  Δopacity  :", delta_opacity.shape)
+
+            print(
+                "Global features:",
+                global_gaussian_features.shape
+            )
+
+            print(
+                "Local features:",
+                local_features_out.shape
+            )
+
+            print(
+                "Unified features:",
+                unified_features.shape
+            )
+
+            # ----------------------------------------------------
+            # COSMOS refined Gaussian attributes
+            # ----------------------------------------------------
+
+            refined_position = (
+                gaussians.get_xyz + delta_position
+            )
+
+            # Rotation: residual quaternion update
+            refined_rotation = (
+                gaussians.get_rotation + delta_rotation
+            )
+
+            refined_rotation = F.normalize(
+                refined_rotation,
+                dim=1
+            )
+
+            # Scale: activated scale space
+            refined_scale = (
+                gaussians.get_scaling + delta_scale
+            )
+
+            refined_scale = refined_scale.clamp_min(1e-8)
+
+            # Color: RGB space
+            refined_color = (
+                SH2RGB(gaussians.get_features[:, 0, :])
+                + delta_color
+            )
+
+            refined_color = refined_color.clamp(0.0, 1.0)
+
+            # Opacity: activated opacity space
+            refined_opacity = (
+                gaussians.get_opacity + delta_opacity
+            )
+
+            refined_opacity = refined_opacity.clamp(
+                1e-6,
+                1.0 - 1e-6
+            )
+
+            print("=" * 70)
+            print("COSMOS REFINED ATTRIBUTES")
+            print("=" * 70)
+
+            print("Position :", refined_position.shape)
+            print("Rotation :", refined_rotation.shape)
+            print("Scale    :", refined_scale.shape)
+            print("Color    :", refined_color.shape)
+            print("Opacity  :", refined_opacity.shape)
+
+            # ============================================================
+            # COSMOS — POSITION REGULARIZATION
+            # ============================================================
+
+            refined_xyz = (
+                gaussians.get_xyz
+                + delta_position
+            )
+
+            D_avg = compute_D_avg(
+                refined_xyz,
+                cosmos_first_edge,
+                cosmos_adj_vertices
+            )
+
+            D_ctr = compute_D_ctr(
+                refined_xyz,
+                gaussians.supergaussian_ids
+            )
+
+            # ============================================================
+            # COSMOS POSITION REGULARIZATION LOSS
+            # ============================================================
+
+            lambda1_pos = 1.0
+            lambda2_pos = 1.0
+
+            L_pos = (
+                lambda1_pos * D_avg
+                + lambda2_pos * D_ctr
+)
+
+            print("COSMOS position regularization:")
+            print("  D_avg :", D_avg.item())
+            print("  D_ctr :", D_ctr.item())
+            print("  L_pos :", L_pos.item())
+
+
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
