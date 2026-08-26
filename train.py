@@ -21,6 +21,7 @@ import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
+from cosmos.group import build_supergaussians
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -49,6 +50,35 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
+
+    # ============================================================
+    # COSMOS — SUPERGAUSSIAN GROUPING
+    # ============================================================
+
+    print("=" * 70)
+    print("COSMOS SUPERGAUSSIAN GROUPING")
+    print("=" * 70)
+
+    groups = build_supergaussians(gaussians)
+
+    gaussians.supergaussian_ids = groups["supergaussian_ids"]
+
+    print("Gaussians      :", gaussians.get_xyz.shape[0])
+    print(
+        "SuperGaussians :",
+        torch.unique(gaussians.supergaussian_ids).numel()
+    )
+    print(
+        "Feature dim    :",
+        groups["features"].shape[1]
+    )
+
+    assert gaussians.supergaussian_ids.shape[0] == \
+        gaussians.get_xyz.shape[0]
+
+    print("=" * 70)
+
+
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)

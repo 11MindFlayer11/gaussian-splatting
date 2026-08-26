@@ -61,6 +61,7 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
+        self.supergaussian_ids = torch.empty(0,dtype=torch.long,device="cuda")
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
@@ -74,6 +75,7 @@ class GaussianModel:
             self._scaling,
             self._rotation,
             self._opacity,
+            self.supergaussian_ids,
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
@@ -89,6 +91,7 @@ class GaussianModel:
         self._scaling, 
         self._rotation, 
         self._opacity,
+        self.supergaussian_ids,
         self.max_radii2D, 
         xyz_gradient_accum, 
         denom,
@@ -174,6 +177,7 @@ class GaussianModel:
         self.pretrained_exposures = None
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
+        self.supergaussian_ids = torch.arange(fused_point_cloud.shape[0],device="cuda",dtype=torch.long)
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
