@@ -36,6 +36,8 @@ from cosmos.losses import (
 )
 
 from cosmos.heads import ResidualMLP
+from cosmos.knn import knn_indices
+from cosmos.graph import knn_to_forward_star
 from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -54,6 +56,55 @@ try:
     SPARSE_ADAM_AVAILABLE = True
 except:
     SPARSE_ADAM_AVAILABLE = False
+
+
+def rebuild_cosmos_local_graph(
+    gaussians,
+    k=16,
+    chunk_size=1024,
+):
+    """
+    Rebuild the local Gaussian KNN graph after
+    densification/pruning changes the Gaussian count.
+
+    Returns:
+        knn_indices
+        first_edge
+        adj_vertices
+        edge_weights
+    """
+
+    xyz = gaussians.get_xyz
+
+    # --------------------------------------------------------
+    # GPU KNN
+    # --------------------------------------------------------
+
+    knn_idx, knn_dist = knn_indices(
+        xyz,
+        k=k,
+        chunk_size=chunk_size
+    )
+
+    # --------------------------------------------------------
+    # Cut-Pursuit / loss graph representation
+    # --------------------------------------------------------
+
+    first_edge, adj_vertices, edge_weights = (
+        knn_to_forward_star(
+            knn_idx,
+            knn_dist,
+            symmetric=True,
+            weight_mode="uniform"
+        )
+    )
+
+    return (
+        knn_idx,
+        first_edge,
+        adj_vertices,
+        edge_weights
+    )
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
@@ -687,17 +738,128 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
-            # Densification
-            if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+            # ===========================================================
+            # Densification / Pruning
+            # ============================================================
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+            if iteration < opt.densify_until_iter:
+
+                # --------------------------------------------------------
+                # Track max image-space radii
+                # --------------------------------------------------------
+
+                gaussians.max_radii2D[visibility_filter] = torch.max(
+                    gaussians.max_radii2D[visibility_filter],
+                    radii[visibility_filter]
+                )
+
+                gaussians.add_densification_stats(
+                    viewspace_point_tensor,
+                    visibility_filter
+                )
+
+                # --------------------------------------------------------
+                # Densify / prune
+                # --------------------------------------------------------
+
+                if (
+                    iteration > opt.densify_from_iter
+                    and iteration % opt.densification_interval == 0
+                ):
+
+                    size_threshold = (
+                        20
+                        if iteration > opt.opacity_reset_interval
+                        else None
+                    )
+
+                    old_num_gaussians = gaussians.get_xyz.shape[0]
+
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold,
+                        0.005,
+                        scene.cameras_extent,
+                        size_threshold,
+                        radii
+                    )
+                    if cosmos_initialized:
+
+                        print(
+                            "[COSMOS DEBUG]",
+                            "xyz =", gaussians.get_xyz.shape,
+                            "ids =", gaussians.supergaussian_ids.shape,
+                            "desc =", gaussians.cosmos_descriptors.shape,
+                            "knn =", cosmos_knn_indices.shape
+                        )
+                    new_num_gaussians = gaussians.get_xyz.shape[0]
+
+                    # ====================================================
+                    # COSMOS LOCAL GRAPH UPDATE
+                    # ====================================================
+
+                    if cosmos_initialized:
+
+                        if new_num_gaussians != old_num_gaussians:
+
+                            print(
+                                f"\n[COSMOS] Gaussian count changed: "
+                                f"{old_num_gaussians} -> {new_num_gaussians}"
+                            )
+
+                            (
+                                cosmos_knn_indices,
+                                new_first_edge,
+                                new_adj_vertices,
+                                new_edge_weights
+                            ) = rebuild_cosmos_local_graph(
+                                gaussians,
+                                k=16,
+                                chunk_size=1024
+                            )
+
+                            # --------------------------------------------------------
+                            # Update local graph used by COSMOS losses
+                            # --------------------------------------------------------
+
+                            cosmos_first_edge = torch.as_tensor(
+                                new_first_edge,
+                                device=gaussians.get_xyz.device,
+                                dtype=torch.long
+                            )
+
+                            cosmos_adj_vertices = torch.as_tensor(
+                                new_adj_vertices,
+                                device=gaussians.get_xyz.device,
+                                dtype=torch.long
+                            )
+
+                            cosmos_edge_weights = torch.as_tensor(
+                                new_edge_weights,
+                                device=gaussians.get_xyz.device,
+                                dtype=torch.float32
+                            )
+
+                            print(
+                                "[COSMOS] Local KNN graph rebuilt:",
+                                cosmos_knn_indices.shape
+                            )
+
+                            print(
+                                "[COSMOS] Forward-star graph rebuilt:",
+                                "vertices =", cosmos_adj_vertices.shape,
+                                "edges =", cosmos_edge_weights.shape
+                            )
+                # --------------------------------------------------------
+                # Opacity reset
+                # --------------------------------------------------------
+
+                if (
+                    iteration % opt.opacity_reset_interval == 0
+                    or (
+                        dataset.white_background
+                        and iteration == opt.densify_from_iter
+                    )
+                ):
                     gaussians.reset_opacity()
 
             # Optimizer step
