@@ -147,7 +147,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     local_pos_encoder = None
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
-    cosmos_initialized = False
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
                 # ========================================================
@@ -164,18 +163,46 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Build SuperGaussian grouping
             # ----------------------------------------------------
 
-            groups = build_supergaussians(gaussians)
+            with torch.no_grad():
+                groups = build_supergaussians(gaussians)
+
+            print("\n========== COSMOS GROUP AUTOGRAD ==========")
+
+            for k, v in groups.items():
+                if torch.is_tensor(v):
+                    print(
+                        f"{k:20s} "
+                        f"dtype={v.dtype} "
+                        f"requires_grad={v.requires_grad} "
+                        f"grad_fn={v.grad_fn}"
+                    )
+
+            print("===========================================\n")
+
+            # COSMOS topology is fixed after initialization.
+            groups["features"] = groups["features"].detach()
 
             gaussians.supergaussian_ids = (
                 groups["supergaussian_ids"]
+            ).detach()
+
+            cosmos_first_edge = torch.as_tensor(
+                groups["first_edge"], device="cuda", dtype=torch.long
+            )
+            
+            cosmos_adj_vertices = torch.as_tensor(
+                groups["adj_vertices"], device="cuda", dtype=torch.long
+            )
+            
+            cosmos_edge_weights = torch.as_tensor(
+                groups["edge_weights"], device="cuda", dtype=torch.float32
+            ).detach()
+            
+            cosmos_knn_indices = torch.as_tensor(
+                groups["knn_indices"], device="cuda", dtype=torch.long
             )
 
-            cosmos_first_edge = groups["first_edge"]
-            cosmos_adj_vertices = groups["adj_vertices"]
-            cosmos_edge_weights = groups["edge_weights"]
-            cosmos_knn_indices = groups["knn_indices"]
-
-            group_centers = groups["group_centers"]
+            group_centers = groups["group_centers"].detach()
 
             # ----------------------------------------------------
             # Feature dimensions
@@ -235,12 +262,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             print("=" * 70)
 
-            # ----------------------------------------------------
-            # Build COSMOS features for current Gaussian state
-            # ----------------------------------------------------
+        
+
+           
 
             # ----------------------------------------------------
-            # COSMOS residual prediction heads
+            # COSMOS residual prediction heads initialization
             # ----------------------------------------------------
 
             unified_dim = 128 + 128  # global + local
@@ -271,7 +298,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ).cuda()
 
             # ----------------------------------------------------
-            # COSMOS optimizer
+            # COSMOS optimizer initialization
             # ----------------------------------------------------
 
             cosmos_optimizer = torch.optim.Adam(
@@ -288,6 +315,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             print("Residual heads initialized.")
             print("Unified feature dimension:", unified_dim)
 
+        if cosmos_initialized:
+
+             # ----------------------------------------------------
+            # Build COSMOS features for current Gaussian state
+            # ----------------------------------------------------
             xyz = gaussians.get_xyz
 
             sh_dc = gaussians.get_features[:, 0, :]
@@ -295,7 +327,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             scale = gaussians.get_scaling
 
-            descriptors = groups["features"][:, 9:13]
+            descriptors = groups["features"][:, 9:13].detach().cuda()
 
             gaussian_features = torch.cat(
                 [
@@ -354,47 +386,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     group_remaining
                 )
             )
-            # ============================================================
-            # COSMOS — GLOBAL SELF-ATTENTION VALIDATION
-            # ============================================================
-
-            print("=" * 70)
-            print("GLOBAL SELF-ATTENTION VALIDATION")
-            print("=" * 70)
-
-            print("Input group centers :", group_centers.shape)
-            print("Input group features:", group_remaining.shape)
-            print("Output features     :", global_features.shape)
-            print("Attention shape     :", global_attention_weights.shape)
-
-            print(
-                "Output finite:",
-                torch.isfinite(global_features).all().item()
-            )
-
-            print(
-                "Attention finite:",
-                torch.isfinite(global_attention_weights).all().item()
-            )
-
-            # Each attention distribution should sum to 1
-            attention_row_sums = (
-                global_attention_weights.sum(dim=-1)
-            )
-
-            print(
-                "Attention row sum min/max:",
-                attention_row_sums.min().item(),
-                attention_row_sums.max().item()
-            )
-
-            print(
-                "Global feature mean/std:",
-                global_features.mean().item(),
-                global_features.std().item()
-            )
-
-            print("=" * 70)
+          
             # ----------------------------------------------------
             # Broadcast global features to Gaussians
             # ----------------------------------------------------
@@ -468,27 +460,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 unified_features
             )
 
-            print("Residual shapes:")
-            print("  Δposition :", delta_position.shape)
-            print("  Δrotation :", delta_rotation.shape)
-            print("  Δscale    :", delta_scale.shape)
-            print("  Δcolor    :", delta_color.shape)
-            print("  Δopacity  :", delta_opacity.shape)
+            # print("Residual shapes:")
+            # print("  Δposition :", delta_position.shape)
+            # print("  Δrotation :", delta_rotation.shape)
+            # print("  Δscale    :", delta_scale.shape)
+            # print("  Δcolor    :", delta_color.shape)
+            # print("  Δopacity  :", delta_opacity.shape)
 
-            print(
-                "Global features:",
-                global_gaussian_features.shape
-            )
+            # print(
+            #     "Global features:",
+            #     global_gaussian_features.shape
+            # )
 
-            print(
-                "Local features:",
-                local_features_out.shape
-            )
+            # print(
+            #     "Local features:",
+            #     local_features_out.shape
+            # )
 
-            print(
-                "Unified features:",
-                unified_features.shape
-            )
+            # print(
+            #     "Unified features:",
+            #     unified_features.shape
+            # )
 
             # ----------------------------------------------------
             # COSMOS refined Gaussian attributes
@@ -533,53 +525,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 1.0 - 1e-6
             )
 
-            print("=" * 70)
-            print("COSMOS REFINED ATTRIBUTES")
-            print("=" * 70)
+            # print("=" * 70)
+            # print("COSMOS REFINED ATTRIBUTES")
+            # print("=" * 70)
 
-            print("Position :", refined_position.shape)
-            print("Rotation :", refined_rotation.shape)
-            print("Scale    :", refined_scale.shape)
-            print("Color    :", refined_color.shape)
-            print("Opacity  :", refined_opacity.shape)
+            # print("Position :", refined_position.shape)
+            # print("Rotation :", refined_rotation.shape)
+            # print("Scale    :", refined_scale.shape)
+            # print("Color    :", refined_color.shape)
+            # print("Opacity  :", refined_opacity.shape)
 
-            # ============================================================
-            # COSMOS — POSITION REGULARIZATION
-            # ============================================================
-
-            refined_xyz = (
-                gaussians.get_xyz
-                + delta_position
-            )
-
-            D_avg = compute_D_avg(
-                refined_xyz,
-                cosmos_first_edge,
-                cosmos_adj_vertices
-            )
-
-            D_ctr = compute_D_ctr(
-                refined_xyz,
-                gaussians.supergaussian_ids
-            )
-
-            # ============================================================
-            # COSMOS POSITION REGULARIZATION LOSS
-            # ============================================================
-
-            lambda1_pos = 1.0
-            lambda2_pos = 1.0
-
-            L_pos = (
-                lambda1_pos * D_avg
-                + lambda2_pos * D_ctr
-)
-
-            print("COSMOS position regularization:")
-            print("  D_avg :", D_avg.item())
-            print("  D_ctr :", D_ctr.item())
-            print("  L_pos :", L_pos.item())
-
+           
 
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -588,7 +544,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE,
+                                override_xyz=refined_position if cosmos_initialized else None,
+                                override_opacity=refined_opacity if cosmos_initialized else None,
+                                override_scale=refined_scale if cosmos_initialized else None,
+                                override_rotation=refined_rotation if cosmos_initialized else None,
+                                override_color=refined_color if cosmos_initialized else None
+                                )["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
@@ -618,7 +580,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, override_xyz=refined_position if cosmos_initialized else None,
+    override_opacity=refined_opacity if cosmos_initialized else None,
+    override_scale=refined_scale if cosmos_initialized else None,
+    override_rotation=refined_rotation if cosmos_initialized else None ,
+    override_color = refined_color if cosmos_initialized else None)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -648,10 +614,54 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             Ll1depth = Ll1depth.item()
         else:
             Ll1depth = 0
+         # ============================================================
+        # COSMOS — POSITION REGULARIZATION
+        # ============================================================
+
+        if cosmos_initialized:
+
+            D_avg = compute_D_avg(
+                refined_position,
+                cosmos_first_edge,
+                cosmos_adj_vertices
+            )
+
+            D_ctr = compute_D_ctr(
+                refined_position,
+                gaussians.supergaussian_ids
+            )
+
+            L_pos = D_avg + D_ctr
+
+            loss = loss + L_pos
+
+        # ============================================================
+        # BACKWARD
+        # ============================================================
 
         loss.backward()
+        # if cosmos_initialized and iteration == 100:
+        #     print("=" * 70)
+        #     print("COSMOS GRADIENT CHECK")
+        #     print("=" * 70)
 
-        iter_end.record()
+        #     print(
+        #         "Global attention grad:",
+        #         global_attention.input_proj.weight.grad is not None
+        #     )
+
+        #     print(
+        #         "Local attention grad:",
+        #         local_attention.input_proj.weight.grad is not None
+        #     )
+
+        #     print(
+        #         "Position head grad:",
+        #         position_head.fc1.weight.grad is not None
+        #     )
+
+        #     print("=" * 70)
+        # iter_end.record()
 
         with torch.no_grad():
             # Progress bar
@@ -694,6 +704,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
+
+                if cosmos_initialized:
+                    cosmos_optimizer.step()
+                    cosmos_optimizer.zero_grad(set_to_none=True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
