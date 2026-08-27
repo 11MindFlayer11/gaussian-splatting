@@ -852,7 +852,44 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # --------------------------------------------------------
                 # Opacity reset
                 # --------------------------------------------------------
+                            # ----------------------------------------------------
+                            # COSMOS topology consistency checks
+                            # ----------------------------------------------------
 
+                            N = gaussians.get_xyz.shape[0]
+
+                            assert gaussians.supergaussian_ids.shape[0] == N, (
+                                f"SuperGaussian ID mismatch: "
+                                f"{gaussians.supergaussian_ids.shape[0]} vs {N}"
+                            )
+
+                            assert gaussians.cosmos_descriptors.shape[0] == N, (
+                                f"COSMOS descriptor mismatch: "
+                                f"{gaussians.cosmos_descriptors.shape[0]} vs {N}"
+                            )
+
+                            assert cosmos_knn_indices.shape[0] == N, (
+                                f"KNN row mismatch: "
+                                f"{cosmos_knn_indices.shape[0]} vs {N}"
+                            )
+
+                            assert cosmos_knn_indices.max() < N, (
+                                f"KNN contains invalid index: "
+                                f"max={cosmos_knn_indices.max()} vs N={N}"
+                            )
+
+                            assert cosmos_knn_indices.min() >= 0, (
+                                f"KNN contains negative index: "
+                                f"min={cosmos_knn_indices.min()}"
+                            )
+
+                            print(
+                                f"[COSMOS] Topology OK: "
+                                f"N={N}, "
+                                f"IDs={gaussians.supergaussian_ids.shape[0]}, "
+                                f"desc={gaussians.cosmos_descriptors.shape[0]}, "
+                                f"KNN={cosmos_knn_indices.shape}"
+                            )
                 if (
                     iteration % opt.opacity_reset_interval == 0
                     or (
