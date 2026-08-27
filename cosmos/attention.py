@@ -17,17 +17,28 @@ class PositionalEncoding3D(nn.Module):
 
         # x: [N, 3]
 
-        features = [x]
+        freqs = 2.0 ** torch.arange(
+            self.num_freqs,
+            device=x.device,
+            dtype=x.dtype
+        )
 
-        for i in range(self.num_freqs):
+        scaled_x = x.unsqueeze(1) * freqs.view(1, -1, 1)
 
-            freq = 2.0 ** i
+        encoded = torch.stack(
+            [
+                torch.sin(scaled_x),
+                torch.cos(scaled_x)
+            ],
+            dim=2
+        )
 
-            features.append(torch.sin(freq * x))
-            features.append(torch.cos(freq * x))
+        encoded = encoded.flatten(start_dim=1)
 
-        return torch.cat(features, dim=-1)
-
+        return torch.cat(
+            [x, encoded],
+            dim=-1
+        )
 class SuperGaussianSelfAttention(nn.Module):
 
     def __init__(

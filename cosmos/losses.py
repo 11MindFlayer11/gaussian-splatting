@@ -7,73 +7,171 @@ def compute_D_avg(
     adj_vertices,
     eps=1e-8
 ):
+    """
+    Vectorized computation of average edge distance.
+
+    Eq. (10):
+        D_avg = (1/N) sum_i [
+            (1/|N_i|) sum_{j in N_i} ||x_i - x_j||
+        ]
+    """
+
     N = xyz.shape[0]
 
-    total = torch.zeros(
-        (),
+    # ------------------------------------------------------------
+    # Number of neighbors for every vertex
+    # ------------------------------------------------------------
+
+    degrees = first_edge[1:] - first_edge[:-1]
+
+    # ------------------------------------------------------------
+    # Build source vertex index for every edge
+    #
+    # Example:
+    # degrees = [2, 3, 1]
+    #
+    # source =
+    # [0, 0, 1, 1, 1, 2]
+    # ------------------------------------------------------------
+
+    source = torch.repeat_interleave(
+        torch.arange(
+            N,
+            device=xyz.device,
+            dtype=torch.long
+        ),
+        degrees
+    )
+
+    # ------------------------------------------------------------
+    # Gather edge endpoints
+    # ------------------------------------------------------------
+
+    neighbors = adj_vertices
+
+    # ------------------------------------------------------------
+    # Compute all edge distances simultaneously
+    # ------------------------------------------------------------
+
+    diff = xyz[source] - xyz[neighbors]
+
+    distances = torch.linalg.norm(
+        diff,
+        dim=1
+    )
+
+    # ------------------------------------------------------------
+    # Sum distances belonging to each source vertex
+    # ------------------------------------------------------------
+
+    distance_sum = torch.zeros(
+        N,
         device=xyz.device,
         dtype=xyz.dtype
     )
 
-    for i in range(N):
+    distance_sum.scatter_add_(
+        0,
+        source,
+        distances
+    )
 
-        start = int(first_edge[i])
-        end = int(first_edge[i + 1])
+    # ------------------------------------------------------------
+    # Average over neighbors
+    # ------------------------------------------------------------
 
-        neighbors = adj_vertices[start:end]
+    avg_distance = distance_sum / (
+        degrees.to(xyz.dtype) + eps
+    )
 
-        if len(neighbors) == 0:
-            continue
+    # ------------------------------------------------------------
+    # Average over all Gaussians
+    # ------------------------------------------------------------
 
-        diff = xyz[i] - xyz[neighbors]
+    return avg_distance.mean()
 
-        # Eq. (10): ||xi - xj||_2, NOT squared
-        distances = torch.linalg.norm(
-            diff,
-            dim=1
-        )
-
-        total += distances.sum() / (
-            len(neighbors) + eps
-        )
-
-    return total / N
 
 def compute_D_ctr(
     xyz,
     supergaussian_ids,
     eps=1e-8
 ):
+    """
+    Vectorized computation of intra-SuperGaussian
+    positional compactness.
+
+        D_ctr = (1/N) sum_g sum_{i in g}
+                ||x_i - c_g||^2
+
+    where c_g is the centroid of SuperGaussian g.
+    """
 
     N = xyz.shape[0]
 
-    unique_groups = torch.unique(
-        supergaussian_ids
+    # ------------------------------------------------------------
+    # Number of groups
+    # ------------------------------------------------------------
+
+    num_groups = (
+        torch.max(supergaussian_ids) + 1
     )
 
-    total = torch.zeros(
-        (),
+    # ------------------------------------------------------------
+    # Compute group sizes
+    # ------------------------------------------------------------
+
+    group_counts = torch.bincount(
+        supergaussian_ids,
+        minlength=num_groups
+    )
+
+    # ------------------------------------------------------------
+    # Compute group coordinate sums
+    #
+    # [N, 3] -> [G, 3]
+    # ------------------------------------------------------------
+
+    group_sums = torch.zeros(
+        num_groups,
+        3,
         device=xyz.device,
         dtype=xyz.dtype
     )
 
-    for g in unique_groups:
+    group_sums.scatter_add_(
+        0,
+        supergaussian_ids.unsqueeze(1).expand(-1, 3),
+        xyz
+    )
 
-        mask = supergaussian_ids == g
+    # ------------------------------------------------------------
+    # Group centroids
+    # ------------------------------------------------------------
 
-        group_xyz = xyz[mask]
+    group_centers = group_sums / (
+        group_counts.to(xyz.dtype).unsqueeze(1) + eps
+    )
 
-        center = group_xyz.sum(dim=0) / (
-            group_xyz.shape[0] + eps
-        )
+    # ------------------------------------------------------------
+    # Difference from corresponding group centroid
+    # ------------------------------------------------------------
 
-        diff = group_xyz - center
+    diff = (
+        xyz
+        - group_centers[supergaussian_ids]
+    )
 
-        squared_dist = torch.sum(
-            diff * diff,
-            dim=1
-        )
+    # ------------------------------------------------------------
+    # Squared distance to centroid
+    # ------------------------------------------------------------
 
-        total += squared_dist.sum()
+    squared_dist = torch.sum(
+        diff * diff,
+        dim=1
+    )
 
-    return total / N
+    # ------------------------------------------------------------
+    # Eq. normalization
+    # ------------------------------------------------------------
+
+    return squared_dist.sum() / N

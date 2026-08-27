@@ -242,6 +242,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 num_heads=4
             ).cuda()
 
+            local_pos_encoder = PositionalEncoding3D(
+                num_freqs=6
+            ).cuda()
             cosmos_initialized = True
 
             print(
@@ -352,27 +355,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.supergaussian_ids
             )
 
-            unique_ids = torch.unique(
-                supergaussian_ids
+            unique_ids, inverse_ids = torch.unique(
+                supergaussian_ids,
+                sorted=True,
+                return_inverse=True
             )
 
-            group_features = []
+            num_groups = unique_ids.shape[0]
+            feature_dim = gaussian_features.shape[1]
 
-            for group_id in unique_ids:
+            group_features = torch.full(
+                (num_groups, feature_dim),
+                -torch.inf,
+                device=gaussian_features.device,
+                dtype=gaussian_features.dtype
+            )
 
-                mask = (
-                    supergaussian_ids == group_id
-                )
-
-                group_features.append(
-                    gaussian_features[mask].max(
-                        dim=0
-                    ).values
-                )
-
-            group_features = torch.stack(
-                group_features,
-                dim=0
+            group_features.scatter_reduce_(
+                0,
+                inverse_ids.unsqueeze(1).expand(-1, feature_dim),
+                gaussian_features,
+                reduce="amax",
+                include_self=True
             )
 
             # ----------------------------------------------------
@@ -398,7 +402,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             global_gaussian_features = (
                 global_features[
-                    supergaussian_ids
+                    inverse_ids
                 ]
             )
 
@@ -406,9 +410,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Local Gaussian features
             # ----------------------------------------------------
 
-            local_pos = PositionalEncoding3D(
-                num_freqs=6
-            ).cuda()(xyz)
+            local_pos = local_pos_encoder(xyz)
 
             local_features = torch.cat(
                 [
