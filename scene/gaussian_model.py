@@ -62,6 +62,7 @@ class GaussianModel:
         self.denom = torch.empty(0)
         self.optimizer = None
         self.supergaussian_ids = torch.empty(0,dtype=torch.long,device="cuda")
+        self.cosmos_descriptors = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
@@ -371,6 +372,9 @@ class GaussianModel:
         self.supergaussian_ids = (
             self.supergaussian_ids[valid_points_mask]
         )
+        self.cosmos_descriptors = (
+            self.cosmos_descriptors[valid_points_mask]
+        )
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -394,7 +398,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_supergaussian_ids):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_supergaussian_ids, new_cosmos_descriptors):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -410,7 +414,7 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self.supergaussian_ids= torch.cat([self.supergaussian_ids, new_supergaussian_ids], dim=0)
-
+        self.cosmos_descriptors = torch.cat([self.cosmos_descriptors, new_cosmos_descriptors],dim=0)
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -452,7 +456,9 @@ class GaussianModel:
         )
 
         new_supergaussian_ids = parent_supergaussian_ids.repeat(N)
-
+        parent_cosmos_descriptors = (self.cosmos_descriptors[selected_pts_mask])
+        new_cosmos_descriptors = (parent_cosmos_descriptors.repeat(N, 1)
+)
         self.densification_postfix(
             new_xyz,
             new_features_dc,
@@ -462,6 +468,7 @@ class GaussianModel:
             new_rotation,
             new_tmp_radii,
             new_supergaussian_ids,
+            new_cosmos_descriptors
         )    
         
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
@@ -484,6 +491,9 @@ class GaussianModel:
         new_supergaussian_ids = (
             self.supergaussian_ids[selected_pts_mask].clone()
         )
+        new_cosmos_descriptors = (
+    self.cosmos_descriptors[selected_pts_mask].clone()
+)
 
         self.densification_postfix(
             new_xyz,
@@ -494,6 +504,7 @@ class GaussianModel:
             new_rotation,
             new_tmp_radii,
             new_supergaussian_ids,
+            new_cosmos_descriptors,
         )
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom

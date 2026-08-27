@@ -186,6 +186,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 groups["supergaussian_ids"]
             ).detach()
 
+            gaussians.cosmos_descriptors = (
+                groups["features"][:, 9:13]
+            ).detach().clone()
+
             cosmos_first_edge = torch.as_tensor(
                 groups["first_edge"], device="cuda", dtype=torch.long
             )
@@ -327,8 +331,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             scale = gaussians.get_scaling
 
-            descriptors = groups["features"][:, 9:13].detach().cuda()
-
+            descriptors = gaussians.cosmos_descriptors
+            assert xyz.shape[0] == gaussians.supergaussian_ids.shape[0]
+            assert xyz.shape[0] == gaussians.cosmos_descriptors.shape[0]
             gaussian_features = torch.cat(
                 [
                     xyz,
@@ -661,7 +666,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         #     )
 
         #     print("=" * 70)
-        # iter_end.record()
+        iter_end.record()
 
         with torch.no_grad():
             # Progress bar
