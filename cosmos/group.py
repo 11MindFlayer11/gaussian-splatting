@@ -3,7 +3,6 @@ import torch
 
 from cosmos.graph import knn_to_forward_star
 from pycut_pursuit.cp_d0_dist import cp_d0_dist
-import torch
 
 from utils.sh_utils import SH2RGB
 from cosmos.knn import knn_indices
@@ -17,151 +16,169 @@ def compute_group_statistics(
     eps=1e-8
 ):
     """
-    Compute spatial statistics for each SuperGaussian group.
-
-    Args:
-        xyz:
-            [N, 3] Gaussian positions
-
-        supergaussian_ids:
-            [N] integer group assignment for each Gaussian
+    Vectorized computation of SuperGaussian statistics.
 
     Returns:
-        group_centers:
-            [G, 3]
-
-        group_covariance:
-            [G, 3, 3]
-
-        group_sizes:
-            [G]
-
-        group_descriptors:
-            [G, 4]
-            columns:
-                0 -> linearity
-                1 -> planarity
-                2 -> scattering
-                3 -> verticality
+        group_centers:      [G, 3]
+        group_covariance:   [G, 3, 3]
+        group_sizes:        [G]
+        group_descriptors:  [G, 4]
     """
 
-    unique_groups = torch.unique(
+    # --------------------------------------------------------
+    # Unique groups
+    # --------------------------------------------------------
+
+    unique_groups, inverse, group_sizes = torch.unique(
         supergaussian_ids,
-        sorted=True
+        sorted=True,
+        return_inverse=True,
+        return_counts=True
     )
 
-    group_centers = []
-    group_covariances = []
-    group_sizes = []
-    group_descriptors = []
+    G = unique_groups.shape[0]
+    N = xyz.shape[0]
 
-    for group_id in unique_groups:
-
-        mask = supergaussian_ids == group_id
-
-        group_xyz = xyz[mask]
-
-        n = group_xyz.shape[0]
-
-        # ----------------------------------------------------
-        # Group center
-        # ----------------------------------------------------
-
-        center = group_xyz.mean(dim=0)
-
-        # ----------------------------------------------------
-        # Group covariance
-        # ----------------------------------------------------
-
-        centered = group_xyz - center
-
-        if n > 1:
-            covariance = (
-                centered.T @ centered
-            ) / n
-        else:
-            covariance = torch.zeros(
-                (3, 3),
-                device=xyz.device,
-                dtype=xyz.dtype
-            )
-
-        # ----------------------------------------------------
-        # Group eigen decomposition
-        # ----------------------------------------------------
-
-        eigenvalues, eigenvectors = torch.linalg.eigh(
-            covariance
-        )
-
-        # eigh -> ascending
-        eigenvalues = torch.flip(
-            eigenvalues,
-            dims=[0]
-        )
-
-        eigenvectors = torch.flip(
-            eigenvectors,
-            dims=[1]
-        )
-
-        lambda1 = eigenvalues[0].clamp_min(eps)
-        lambda2 = eigenvalues[1]
-        lambda3 = eigenvalues[2]
-
-        # ----------------------------------------------------
-        # Group geometric descriptors
-        # ----------------------------------------------------
-
-        linearity = (
-            (lambda1 - lambda2) / lambda1
-        ).clamp(0.0, 1.0)
-
-        planarity = (
-            (lambda2 - lambda3) / lambda1
-        ).clamp(0.0, 1.0)
-
-        scattering = (
-            lambda3 / lambda1
-        ).clamp(0.0, 1.0)
-
-        # Smallest-eigenvalue eigenvector = normal
-        normal = eigenvectors[:, 2]
-
-        verticality = (
-            1.0 - normal[2].abs()
-        ).clamp(0.0, 1.0)
-
-        descriptor = torch.stack(
-            [
-                linearity,
-                planarity,
-                scattering,
-                verticality
-            ]
-        )
-
-        group_centers.append(center)
-        group_covariances.append(covariance)
-        group_sizes.append(n)
-        group_descriptors.append(descriptor)
-
-    group_centers = torch.stack(group_centers)
-    group_covariances = torch.stack(group_covariances)
-    group_sizes = torch.tensor(
-        group_sizes,
+    group_sizes = group_sizes.to(
         device=xyz.device,
         dtype=torch.long
     )
-    group_descriptors = torch.stack(group_descriptors)
+
+    # --------------------------------------------------------
+    # Group centers
+    #
+    # scatter_add:
+    #   sum of xyz belonging to each group
+    # --------------------------------------------------------
+
+    group_sums = torch.zeros(
+        G,
+        3,
+        device=xyz.device,
+        dtype=xyz.dtype
+    )
+
+    group_sums.scatter_add_(
+        0,
+        inverse.unsqueeze(1).expand(-1, 3),
+        xyz
+    )
+
+    group_centers = (
+        group_sums /
+        group_sizes.unsqueeze(1).to(xyz.dtype)
+    )
+
+    # --------------------------------------------------------
+    # Center every Gaussian
+    # --------------------------------------------------------
+
+    centered = (
+        xyz -
+        group_centers[inverse]
+    )
+
+    # --------------------------------------------------------
+    # Group covariance
+    #
+    # covariance[g] =
+    #   1 / |g| sum_i (x_i-c_g)(x_i-c_g)^T
+    # --------------------------------------------------------
+
+    outer_products = (
+        centered.unsqueeze(2) *
+        centered.unsqueeze(1)
+    )
+
+    group_covariance = torch.zeros(
+        G,
+        3,
+        3,
+        device=xyz.device,
+        dtype=xyz.dtype
+    )
+
+    group_covariance.scatter_add_(
+        0,
+        inverse[:, None, None].expand(-1, 3, 3),
+        outer_products
+    )
+
+    group_covariance = (
+        group_covariance /
+        group_sizes.to(xyz.dtype)[:, None, None]
+    )
+
+    # --------------------------------------------------------
+    # Eigen decomposition
+    # --------------------------------------------------------
+
+    eigenvalues, eigenvectors = torch.linalg.eigh(
+        group_covariance
+    )
+
+    # eigh returns ascending eigenvalues:
+    #
+    # lambda3 <= lambda2 <= lambda1
+    #
+    # Reverse to:
+    #
+    # lambda1 >= lambda2 >= lambda3
+    # --------------------------------------------------------
+
+    eigenvalues = torch.flip(
+        eigenvalues,
+        dims=[1]
+    )
+
+    eigenvectors = torch.flip(
+        eigenvectors,
+        dims=[2]
+    )
+
+    lambda1 = eigenvalues[:, 0].clamp_min(eps)
+    lambda2 = eigenvalues[:, 1]
+    lambda3 = eigenvalues[:, 2]
+
+    # --------------------------------------------------------
+    # Geometric descriptors
+    # --------------------------------------------------------
+
+    linearity = (
+        (lambda1 - lambda2) / lambda1
+    ).clamp(0.0, 1.0)
+
+    planarity = (
+        (lambda2 - lambda3) / lambda1
+    ).clamp(0.0, 1.0)
+
+    scattering = (
+        lambda3 / lambda1
+    ).clamp(0.0, 1.0)
+
+    # Smallest eigenvalue eigenvector = normal
+    normal = eigenvectors[:, :, 2]
+
+    verticality = (
+        1.0 - normal[:, 2].abs()
+    ).clamp(0.0, 1.0)
+
+    group_descriptors = torch.stack(
+        [
+            linearity,
+            planarity,
+            scattering,
+            verticality
+        ],
+        dim=1
+    )
 
     return (
         group_centers,
-        group_covariances,
+        group_covariance,
         group_sizes,
         group_descriptors
     )
-
 
 def supergaussian_grouping(
     xyz,

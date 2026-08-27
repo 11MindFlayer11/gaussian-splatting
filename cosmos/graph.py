@@ -11,137 +11,227 @@ def knn_to_forward_star(
     eps=1e-8,
 ):
     """
-    Convert a KNN neighborhood representation into the
-    forward-star graph representation required by Cut Pursuit.
+    Convert KNN representation into the forward-star graph
+    representation required by Cut Pursuit.
 
-    Args:
-        knn_indices:
-            [N, K] integer tensor containing neighbor indices.
-
-        knn_distances:
-            [N, K] tensor containing Euclidean distances.
-
-        symmetric:
-            If True, symmetrize the directed KNN graph.
-
-        weight_mode:
-            How to compute graph edge weights.
-
-            "uniform":
-                w_ij = 1
-
-            "inverse_distance":
-                w_ij = 1 / (d_ij + eps)
-
-            "gaussian":
-                w_ij = exp(-d_ij^2 / (2 sigma^2))
-
-        eps:
-            Numerical stability constant.
-
-    Returns:
-        first_edge:
-            [N + 1] uint32 NumPy array.
-
-        adj_vertices:
-            [E] uint32 NumPy array.
-
-        edge_weights:
-            [E] float32 NumPy array.
+    The Cut Pursuit boundary is CPU/NumPy, so tensors are moved
+    to CPU once and all graph construction is vectorized.
     """
 
-    knn_indices = knn_indices.detach().cpu()
-    knn_distances = knn_distances.detach().cpu()
+    # ------------------------------------------------------------
+    # Move to CPU once
+    # ------------------------------------------------------------
+
+    knn_indices = (
+        knn_indices
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.int64, copy=False)
+    )
+
+    knn_distances = (
+        knn_distances
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32, copy=False)
+    )
 
     N, K = knn_indices.shape
 
-    edges = []
+    # ------------------------------------------------------------
+    # Construct directed KNN edges
+    #
+    # src = [0,0,...,1,1,...]
+    # dst = corresponding KNN indices
+    # ------------------------------------------------------------
 
-    for i in range(N):
+    src = np.repeat(
+        np.arange(N, dtype=np.int64),
+        K
+    )
 
-        for j_idx in range(K):
+    dst = knn_indices.reshape(-1)
 
-            j = int(knn_indices[i, j_idx])
-            d = float(knn_distances[i, j_idx])
+    distances = knn_distances.reshape(-1)
 
-            edges.append((i, j, d))
+    # ------------------------------------------------------------
+    # Symmetrize
+    #
+    # Add:
+    #
+    # i -> j
+    #
+    # and:
+    #
+    # j -> i
+    # ------------------------------------------------------------
 
-            if symmetric:
-                edges.append((j, i, d))
+    if symmetric:
 
-    # --------------------------------------------------
-    # Remove duplicate edges
-    # --------------------------------------------------
+        src = np.concatenate(
+            [src, dst]
+        )
 
-    unique_edges = {}
+        dst = np.concatenate(
+            [dst, src[:N * K]]
+        )
 
-    for i, j, d in edges:
+        distances = np.concatenate(
+            [distances, distances.copy()]
+        )
 
-        key = (i, j)
+    # ------------------------------------------------------------
+    # Remove duplicate directed edges
+    #
+    # We keep the minimum distance when both
+    # directions / KNN lists produce the same edge.
+    # ------------------------------------------------------------
 
-        if key not in unique_edges:
-            unique_edges[key] = d
-        else:
-            unique_edges[key] = min(unique_edges[key], d)
+    edge_keys = (
+        src.astype(np.int64) * N
+        + dst.astype(np.int64)
+    )
 
-    edges = sorted(unique_edges.items())
+    order = np.argsort(
+        edge_keys,
+        kind="stable"
+    )
 
-    # --------------------------------------------------
-    # Build forward-star representation
-    # --------------------------------------------------
+    edge_keys_sorted = edge_keys[order]
 
-    first_edge = np.zeros(N + 1, dtype=np.uint32)
+    src_sorted = src[order]
+    dst_sorted = dst[order]
+    distances_sorted = distances[order]
 
-    adj_vertices = []
-    edge_distances = []
+    # First occurrence of every unique (src, dst)
+    unique_mask = np.empty(
+        edge_keys_sorted.shape,
+        dtype=bool
+    )
 
-    current_vertex = 0
-    edge_count = 0
+    unique_mask[0] = True
 
-    for (i, j), d in edges:
+    unique_mask[1:] = (
+        edge_keys_sorted[1:]
+        != edge_keys_sorted[:-1]
+    )
 
-        while current_vertex <= i:
-            first_edge[current_vertex] = edge_count
-            current_vertex += 1
+    # Since duplicate edges are adjacent after sorting,
+    # we need the minimum distance for each group.
+    #
+    # Find group boundaries.
+    group_starts = np.flatnonzero(
+        unique_mask
+    )
 
-        adj_vertices.append(j)
-        edge_distances.append(d)
+    group_ends = np.concatenate(
+        [
+            group_starts[1:],
+            np.array(
+                [len(distances_sorted)],
+                dtype=np.int64
+            )
+        ]
+    )
 
-        edge_count += 1
+    min_distances = np.minimum.reduceat(
+        distances_sorted,
+        group_starts
+    )
 
-    while current_vertex <= N:
-        first_edge[current_vertex] = edge_count
-        current_vertex += 1
+    src_unique = src_sorted[
+        group_starts
+    ]
 
-    adj_vertices = np.asarray(
-        adj_vertices,
+    dst_unique = dst_sorted[
+        group_starts
+    ]
+
+    # ------------------------------------------------------------
+    # Sort edges by source vertex
+    #
+    # Forward-star requires all outgoing edges from
+    # vertex i to be contiguous.
+    # ------------------------------------------------------------
+
+    source_order = np.argsort(
+        src_unique,
+        kind="stable"
+    )
+
+    src_unique = src_unique[
+        source_order
+    ]
+
+    dst_unique = dst_unique[
+        source_order
+    ]
+
+    edge_distances = min_distances[
+        source_order
+    ].astype(
+        np.float32,
+        copy=False
+    )
+
+    # ------------------------------------------------------------
+    # Forward-star offsets
+    # ------------------------------------------------------------
+
+    edge_count = len(src_unique)
+
+    first_edge = np.zeros(
+        N + 1,
         dtype=np.uint32
     )
 
-    edge_distances = np.asarray(
-        edge_distances,
-        dtype=np.float32
+    counts = np.bincount(
+        src_unique,
+        minlength=N
     )
 
-    # --------------------------------------------------
+    first_edge[1:] = np.cumsum(
+        counts,
+        dtype=np.uint64
+    ).astype(
+        np.uint32
+    )
+
+    # ------------------------------------------------------------
+    # Adjacency
+    # ------------------------------------------------------------
+
+    adj_vertices = dst_unique.astype(
+        np.uint32,
+        copy=False
+    )
+
+    # ------------------------------------------------------------
     # Edge weights
-    # --------------------------------------------------
+    # ------------------------------------------------------------
 
     if weight_mode == "uniform":
 
-        edge_weights = np.ones_like(
-            edge_distances,
+        edge_weights = np.ones(
+            edge_count,
             dtype=np.float32
         )
 
     elif weight_mode == "inverse_distance":
 
-        edge_weights = 1.0 / (
-            edge_distances + eps
+        edge_weights = (
+            1.0
+            / (edge_distances + eps)
+        ).astype(
+            np.float32
         )
 
-        edge_weights = edge_weights.astype(
-            np.float32
+    elif weight_mode == "gaussian":
+
+        raise NotImplementedError(
+            "Gaussian edge weights require a sigma parameter."
         )
 
     else:
