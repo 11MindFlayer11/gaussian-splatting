@@ -436,8 +436,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             group_centers = group_centers / group_counts.clamp_min(1.0)
 
-
-            print(
+            if iteration in testing_iterations:
+                print(
                     f"[COSMOS] "
                     f"Gaussians={xyz.shape[0]} "
                     f"SuperGaussians={num_groups}"
