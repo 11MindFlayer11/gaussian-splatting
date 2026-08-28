@@ -371,12 +371,30 @@ class GaussianModel:
         self.tmp_radii = self.tmp_radii[valid_points_mask]
 
          # Keep SuperGaussian IDs aligned with the surviving Gaussians.
+        # Keep SuperGaussian IDs aligned with surviving Gaussians.
         self.supergaussian_ids = (
             self.supergaussian_ids[valid_points_mask]
         )
+
         self.cosmos_descriptors = (
             self.cosmos_descriptors[valid_points_mask]
         )
+
+        # --------------------------------------------------------
+        # Remove vanished SuperGaussians and compact their IDs.
+        #
+        # Example:
+        #   before: [0, 0, 1, 2, 2, 4, 4]
+        #   group 3 vanished
+        #
+        #   after:  [0, 0, 1, 2, 2, 3, 3]
+        # --------------------------------------------------------
+
+        _, self.supergaussian_ids = torch.unique(
+                self.supergaussian_ids,
+                sorted=True,
+                return_inverse=True
+)
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -416,6 +434,13 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self.supergaussian_ids= torch.cat([self.supergaussian_ids, new_supergaussian_ids], dim=0)
+
+        _, self.supergaussian_ids = torch.unique(
+                    self.supergaussian_ids,
+                    sorted=True,
+                    return_inverse=True
+                )
+
         self.cosmos_descriptors = torch.cat([self.cosmos_descriptors, new_cosmos_descriptors],dim=0)
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")

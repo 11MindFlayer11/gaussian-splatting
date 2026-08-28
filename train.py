@@ -257,7 +257,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 groups["knn_indices"], device="cuda", dtype=torch.long
             )
 
-            group_centers = groups["group_centers"].detach()
+            # group_centers = groups["group_centers"].detach()
 
             # ----------------------------------------------------
             # Feature dimensions
@@ -412,9 +412,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 return_inverse=True
             )
 
+            # IMPORTANT:
+            # Compute the number of currently surviving SuperGaussians
+            # before allocating any group-level tensors.
             num_groups = unique_ids.shape[0]
-            feature_dim = gaussian_features.shape[1]
 
+            group_centers = torch.zeros(
+                (num_groups, 3),
+                device=xyz.device,
+                dtype=xyz.dtype
+            )
+
+            group_centers.scatter_add_(
+                0,
+                inverse_ids.unsqueeze(1).expand(-1, 3),
+                xyz
+            )
+
+            group_counts = torch.bincount(
+                inverse_ids,
+                minlength=num_groups
+            ).to(xyz.dtype).unsqueeze(1)
+
+            group_centers = group_centers / group_counts.clamp_min(1.0)
+
+
+            print(
+                    f"[COSMOS] "
+                    f"Gaussians={xyz.shape[0]} "
+                    f"SuperGaussians={num_groups}"
+                )
+
+            
+            feature_dim = gaussian_features.shape[1]
             group_features = torch.full(
                 (num_groups, feature_dim),
                 -torch.inf,
@@ -691,7 +721,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             L_pos = D_avg + D_ctr
 
-            loss = loss + L_pos
+            loss = loss + 0.1*L_pos
 
         # ============================================================
         # BACKWARD
