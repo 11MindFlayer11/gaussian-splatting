@@ -583,14 +583,28 @@ class GaussianModel:
         # Prune based on the opacity that's actually rendered (base +
         # COSMOS delta_opacity) when available, rather than the raw base
         # opacity — otherwise COSMOS's residual head can keep a Gaussian
-        # visually alive while its base opacity parameter drifts (or gets
-        # reset) below min_opacity, causing it to be pruned regardless.
+        # visually alive while its base opacity parameter drifts below
+        # min_opacity, causing it to be pruned regardless.
+        #
+        # However, delta_opacity is an unconstrained residual that is NOT
+        # a function of the current base opacity (opacity is never fed
+        # into the attention heads), so it can't "notice" when
+        # reset_opacity() suddenly drops every Gaussian's base opacity to
+        # ~0.01. Right after a reset, delta_opacity is still calibrated
+        # for the *old*, much higher base opacity — typically a negative
+        # offset — which alone can push refined_opacity below min_opacity
+        # for effectively every Gaussian at once. Requiring BOTH signals
+        # to agree a Gaussian is negligible (rather than trusting the
+        # refined value alone) makes the prune check immune to this
+        # reset/residual staleness while still letting COSMOS prune
+        # Gaussians it has genuinely learned are redundant.
         effective_opacity = (
             self.cosmos_effective_opacity
             if self.cosmos_effective_opacity is not None
             else self.get_opacity
         )
-        prune_mask = (effective_opacity < min_opacity).squeeze()
+        opacity_for_pruning = torch.maximum(effective_opacity, self.get_opacity)
+        prune_mask = (opacity_for_pruning < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
@@ -598,8 +612,6 @@ class GaussianModel:
         self.prune_points(prune_mask)
         tmp_radii = self.tmp_radii
         self.tmp_radii = None
-
-        torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)

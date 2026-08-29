@@ -111,6 +111,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
+    torch.backends.cudnn.benchmark = True
+
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
@@ -548,7 +550,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 unified_features
             )
 
-            delta_opacity = delta_opacity.clamp(-0.05, 0.05)
             # print("Residual shapes:")
             # print("  Δposition :", delta_position.shape)
             # print("  Δrotation :", delta_rotation.shape)
