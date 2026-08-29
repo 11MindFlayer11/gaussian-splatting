@@ -34,6 +34,10 @@ class ResidualMLP(nn.Module):
             input_dim,
             output_dim
         )
+        nn.init.zeros_(self.fc3.weight)
+        nn.init.zeros_(self.fc3.bias)
+        nn.init.zeros_(self.skip.weight)
+        nn.init.zeros_(self.skip.bias)
 
     def forward(self, x):
 
