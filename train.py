@@ -548,6 +548,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 unified_features
             )
 
+            delta_opacity = delta_opacity.clamp(-0.05, 0.05)
             # print("Residual shapes:")
             # print("  Δposition :", delta_position.shape)
             # print("  Δrotation :", delta_rotation.shape)
