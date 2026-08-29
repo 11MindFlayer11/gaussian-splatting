@@ -362,14 +362,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # ----------------------------------------------------
 
             cosmos_optimizer = torch.optim.Adam(
-                list(global_attention.parameters())
-                + list(local_attention.parameters())
-                + list(position_head.parameters())
-                + list(orientation_head.parameters())
-                + list(scale_head.parameters())
-                + list(color_head.parameters())
-                + list(opacity_head.parameters()),
-                lr=1e-4
+                [
+                    {"params": position_head.parameters(), "lr": 1e-5},
+                    {"params": (
+                        list(global_attention.parameters())
+                        + list(local_attention.parameters())
+                        + list(orientation_head.parameters())
+                        + list(scale_head.parameters())
+                        + list(color_head.parameters())
+                        + list(opacity_head.parameters())
+                    ), "lr": 1e-4},
+                ]
             )
 
             print("Residual heads initialized.")
@@ -575,6 +578,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # ----------------------------------------------------
             # COSMOS refined Gaussian attributes
             # ----------------------------------------------------
+            max_disp = 2.0 * gaussians.get_scaling.max(dim=1, keepdim=True).values
+            disp_norm = delta_position.norm(dim=1, keepdim=True)
+            scale_factor = (max_disp / disp_norm.clamp_min(1e-8)).clamp(max=1.0)
+            delta_position = delta_position * scale_factor
+
+            warmup_iters = 500
+            ramp = min(1.0, max(0.0, (iteration - 100) / warmup_iters))
+            delta_position = ramp * delta_position
 
             refined_position = (
                 gaussians.get_xyz + delta_position
@@ -728,8 +739,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 refined_position,
                 gaussians.supergaussian_ids
             )
-
-            L_pos = D_avg + D_ctr
+            D_anchor = delta_position.pow(2).sum(dim=1).mean()
+            L_pos = D_avg + D_ctr + 10.0 * D_anchor
 
             loss = loss + 0.1*L_pos
 
