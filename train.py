@@ -613,6 +613,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 1.0 - 1e-6
             )
 
+            # ----------------------------------------------------
+            # Keep the model's notion of "current opacity" in sync
+            # with what's actually rendered, so opacity-based pruning
+            # (densify_and_prune) judges Gaussians by their real
+            # contribution instead of the decoupled base parameter.
+            # ----------------------------------------------------
+            gaussians.cosmos_effective_opacity = refined_opacity.detach()
+
             # print("=" * 70)
             # print("COSMOS REFINED ATTRIBUTES")
             # print("=" * 70)
@@ -722,6 +730,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             L_pos = D_avg + D_ctr
 
             loss = loss + 0.1*L_pos
+
+            # ----------------------------------------------------
+            # COSMOS — OPACITY RESIDUAL REGULARIZATION
+            # ----------------------------------------------------
+            # Keeps delta_opacity acting as a small correction on top
+            # of the base opacity rather than becoming the primary
+            # carrier of opacity signal. Without this, the network can
+            # satisfy the photometric loss purely through delta_opacity
+            # while the base opacity (what reset_opacity() and, if it
+            # weren't for cosmos_effective_opacity, pruning would look
+            # at) drifts independently — e.g. staying pinned near zero
+            # after a periodic opacity reset.
+            L_opacity_reg = delta_opacity.pow(2).mean()
+            loss = loss + 0.01 * L_opacity_reg
 
         # ============================================================
         # BACKWARD
