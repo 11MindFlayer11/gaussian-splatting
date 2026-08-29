@@ -389,12 +389,12 @@ class GaussianModel:
         #
         #   after:  [0, 0, 1, 2, 2, 3, 3]
         # --------------------------------------------------------
-
-        _, self.supergaussian_ids = torch.unique(
-                self.supergaussian_ids,
-                sorted=True,
-                return_inverse=True
-)
+        #I DONT THINK COMPACTION IS NEEDED SO I REMOVED IT.
+        # _, self.supergaussian_ids = torch.unique(
+        #         self.supergaussian_ids,
+        #         sorted=True,
+        #         return_inverse=True
+        # )
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -435,11 +435,11 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
         self.supergaussian_ids= torch.cat([self.supergaussian_ids, new_supergaussian_ids], dim=0)
 
-        _, self.supergaussian_ids = torch.unique(
-                    self.supergaussian_ids,
-                    sorted=True,
-                    return_inverse=True
-                )
+        # _, self.supergaussian_ids = torch.unique(
+        #             self.supergaussian_ids,
+        #             sorted=True,
+        #             return_inverse=True
+        #         )
 
         self.cosmos_descriptors = torch.cat([self.cosmos_descriptors, new_cosmos_descriptors],dim=0)
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
