@@ -731,19 +731,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             loss = loss + 0.1*L_pos
 
-            # ----------------------------------------------------
-            # COSMOS — OPACITY RESIDUAL REGULARIZATION
-            # ----------------------------------------------------
-            # Keeps delta_opacity acting as a small correction on top
-            # of the base opacity rather than becoming the primary
-            # carrier of opacity signal. Without this, the network can
-            # satisfy the photometric loss purely through delta_opacity
-            # while the base opacity (what reset_opacity() and, if it
-            # weren't for cosmos_effective_opacity, pruning would look
-            # at) drifts independently — e.g. staying pinned near zero
-            # after a periodic opacity reset.
-            L_opacity_reg = delta_opacity.pow(2).mean()
-            loss = loss + 0.01 * L_opacity_reg
+           
 
         # ============================================================
         # BACKWARD
