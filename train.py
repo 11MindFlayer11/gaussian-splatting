@@ -835,7 +835,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         scene.cameras_extent,
                         size_threshold,
                         radii,
-                        max_num_gaussians=300000
+                        max_num_gaussians=opt.cosmos_max_num_gaussians
                     )
                     if cosmos_initialized:
 
@@ -945,11 +945,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 f"desc={gaussians.cosmos_descriptors.shape[0]}, "
                                 f"KNN={cosmos_knn_indices.shape}"
                             )
-                if (
+                if ((
                     iteration % opt.opacity_reset_interval == 0
                     or (
                         dataset.white_background
                         and iteration == opt.densify_from_iter
+                    )) and not (
+                        opt.cosmos_skip_opacity_reset and cosmos_initialized
                     )
                 ):
                     gaussians.reset_opacity()

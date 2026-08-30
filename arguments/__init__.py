@@ -97,6 +97,8 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        self.cosmos_skip_opacity_reset = False
+        self.cosmos_max_num_gaussians = 300000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
