@@ -63,14 +63,6 @@ class GaussianModel:
         self.optimizer = None
         self.supergaussian_ids = torch.empty(0,dtype=torch.long,device="cuda")
         self.cosmos_descriptors = None
-        # Effective (rendered) opacity from the COSMOS residual pass —
-        # i.e. get_opacity + delta_opacity, clamped, from the most recent
-        # forward pass. Kept in lockstep with the Gaussian population
-        # (via prune_points / densification_postfix) so that pruning can
-        # judge Gaussians by what's actually rendered, not just by the
-        # raw base opacity parameter, which COSMOS can freely decouple
-        # from the rendered result.
-        self.cosmos_effective_opacity = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
@@ -387,12 +379,6 @@ class GaussianModel:
         self.cosmos_descriptors = (
             self.cosmos_descriptors[valid_points_mask]
         )
-
-        if self.cosmos_effective_opacity is not None:
-            self.cosmos_effective_opacity = (
-                self.cosmos_effective_opacity[valid_points_mask]
-            )
-
         # --------------------------------------------------------
         # Remove vanished SuperGaussians and compact their IDs.
         #
@@ -431,7 +417,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_supergaussian_ids, new_cosmos_descriptors, new_effective_opacity=None):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_supergaussian_ids, new_cosmos_descriptors):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -456,16 +442,6 @@ class GaussianModel:
 
         self.cosmos_descriptors = torch.cat([self.cosmos_descriptors, new_cosmos_descriptors],dim=0)
 
-        if self.cosmos_effective_opacity is not None:
-            if new_effective_opacity is None:
-                # Newly created Gaussians haven't been through a COSMOS
-                # forward pass yet, so fall back to their base opacity
-                # as a placeholder — it'll be replaced with a real
-                # effective opacity on the next forward pass anyway.
-                new_effective_opacity = new_opacities.detach()
-            self.cosmos_effective_opacity = torch.cat(
-                [self.cosmos_effective_opacity, new_effective_opacity], dim=0
-            )
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -511,11 +487,7 @@ class GaussianModel:
         parent_cosmos_descriptors = (self.cosmos_descriptors[selected_pts_mask])
         new_cosmos_descriptors = (parent_cosmos_descriptors.repeat(N, 1)
 )
-        new_effective_opacity = None
-        if self.cosmos_effective_opacity is not None:
-            new_effective_opacity = (
-                self.cosmos_effective_opacity[selected_pts_mask].repeat(N, 1)
-            )
+        
 
         self.densification_postfix(
             new_xyz,
@@ -526,8 +498,7 @@ class GaussianModel:
             new_rotation,
             new_tmp_radii,
             new_supergaussian_ids,
-            new_cosmos_descriptors,
-            new_effective_opacity
+            new_cosmos_descriptors
         )    
         
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
@@ -554,11 +525,6 @@ class GaussianModel:
     self.cosmos_descriptors[selected_pts_mask].clone()
 )
 
-        new_effective_opacity = None
-        if self.cosmos_effective_opacity is not None:
-            new_effective_opacity = (
-                self.cosmos_effective_opacity[selected_pts_mask].clone()
-            )
 
         self.densification_postfix(
             new_xyz,
@@ -570,7 +536,6 @@ class GaussianModel:
             new_tmp_radii,
             new_supergaussian_ids,
             new_cosmos_descriptors,
-            new_effective_opacity,
         )
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom
@@ -580,31 +545,7 @@ class GaussianModel:
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
 
-        # Prune based on the opacity that's actually rendered (base +
-        # COSMOS delta_opacity) when available, rather than the raw base
-        # opacity — otherwise COSMOS's residual head can keep a Gaussian
-        # visually alive while its base opacity parameter drifts below
-        # min_opacity, causing it to be pruned regardless.
-        #
-        # However, delta_opacity is an unconstrained residual that is NOT
-        # a function of the current base opacity (opacity is never fed
-        # into the attention heads), so it can't "notice" when
-        # reset_opacity() suddenly drops every Gaussian's base opacity to
-        # ~0.01. Right after a reset, delta_opacity is still calibrated
-        # for the *old*, much higher base opacity — typically a negative
-        # offset — which alone can push refined_opacity below min_opacity
-        # for effectively every Gaussian at once. Requiring BOTH signals
-        # to agree a Gaussian is negligible (rather than trusting the
-        # refined value alone) makes the prune check immune to this
-        # reset/residual staleness while still letting COSMOS prune
-        # Gaussians it has genuinely learned are redundant.
-        effective_opacity = (
-            self.cosmos_effective_opacity
-            if self.cosmos_effective_opacity is not None
-            else self.get_opacity
-        )
-        opacity_for_pruning = torch.maximum(effective_opacity, self.get_opacity)
-        prune_mask = (opacity_for_pruning < min_opacity).squeeze()
+        prune_mask = (self.get_opacity<min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent

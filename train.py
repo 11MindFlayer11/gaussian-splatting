@@ -632,7 +632,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # (densify_and_prune) judges Gaussians by their real
             # contribution instead of the decoupled base parameter.
             # ----------------------------------------------------
-            gaussians.cosmos_effective_opacity = refined_opacity.detach()
+            # gaussians.cosmos_effective_opacity = refined_opacity.detach()
 
             # print("=" * 70)
             # print("COSMOS REFINED ATTRIBUTES")
