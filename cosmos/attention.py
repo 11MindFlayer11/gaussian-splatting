@@ -200,98 +200,33 @@ class SparseLocalAttention(nn.Module):
 
         self.norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, x, neighbor_indices):
-
+    def forward(self, x, neighbor_indices, chunk_size=50000):
         N = x.shape[0]
-        K_neighbors = neighbor_indices.shape[1]
-
-        # ----------------------------------------------------
-        # Project Gaussian features
-        # ----------------------------------------------------
-
         x = self.input_proj(x)
         x = self.norm(x)
 
-        # ----------------------------------------------------
-        # Q for every Gaussian
-        # ----------------------------------------------------
+        Q_full = self.q_proj(x)
+        outputs = []
+        attn_chunks = []
 
-        Q = self.q_proj(x)
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
 
-        # ----------------------------------------------------
-        # K and V for 10 neighbors
-        # ----------------------------------------------------
+            Q = Q_full[start:end].view(end - start, self.num_heads, self.head_dim)
 
-        neighbor_x = x[neighbor_indices]
+            neighbor_x = x[neighbor_indices[start:end]]
+            K = self.k_proj(neighbor_x).view(end - start, -1, self.num_heads, self.head_dim)
+            V = self.v_proj(neighbor_x).view(end - start, -1, self.num_heads, self.head_dim)
 
-        K = self.k_proj(neighbor_x)
-        V = self.v_proj(neighbor_x)
+            scores = torch.einsum("nhd,nkhd->nhk", Q, K) / (self.head_dim ** 0.5)
+            attention = F.softmax(scores, dim=-1)
+            local = torch.einsum("nhk,nkhd->nhd", attention, V)
 
-        # Q:
-        # [N, D]
-        #
-        # K,V:
-        # [N, 10, D]
+            outputs.append(local.reshape(end - start, self.embed_dim))
+            attn_chunks.append(attention)
 
-        # ----------------------------------------------------
-        # Split attention heads
-        # ----------------------------------------------------
-
-        Q = Q.view(
-            N,
-            self.num_heads,
-            self.head_dim
-        )
-
-        K = K.view(
-            N,
-            K_neighbors,
-            self.num_heads,
-            self.head_dim
-        )
-
-        V = V.view(
-            N,
-            K_neighbors,
-            self.num_heads,
-            self.head_dim
-        )
-
-        # ----------------------------------------------------
-        # Attention scores
-        # ----------------------------------------------------
-
-        scores = torch.einsum(
-            "nhd,nkhd->nhk",
-            Q,
-            K
-        )
-
-        scores = scores / (self.head_dim ** 0.5)
-
-        attention = F.softmax(
-            scores,
-            dim=-1
-        )
-
-        # ----------------------------------------------------
-        # Weighted aggregation
-        # ----------------------------------------------------
-
-        local = torch.einsum(
-            "nhk,nkhd->nhd",
-            attention,
-            V
-        )
-
-        # [N, heads, head_dim]
-        # -> [N, embed_dim]
-
-        local = local.reshape(
-            N,
-            self.embed_dim
-        )
+        local = torch.cat(outputs, dim=0)
+        attention = torch.cat(attn_chunks, dim=0)
 
         local = self.out_proj(local)
-
         return local, attention

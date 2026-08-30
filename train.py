@@ -743,7 +743,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             L_pos = D_avg + D_ctr + 10.0 * D_anchor
 
             D_opacity_anchor = delta_opacity.pow(2).mean()
-            loss = loss + 0.1 * L_pos + 0.01 * D_opacity_anchor 
+            loss = loss + 0.1 * L_pos + 1.0 * D_opacity_anchor 
 
            
 
