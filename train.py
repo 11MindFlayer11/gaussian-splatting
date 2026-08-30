@@ -743,7 +743,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             L_pos = D_avg + D_ctr + 10.0 * D_anchor
 
             D_opacity_anchor = delta_opacity.pow(2).mean()
-            loss = loss + 0.1 * L_pos + 1.0 * D_opacity_anchor 
+            loss = loss + 0.1 * L_pos + 1.0  * D_opacity_anchor 
 
            
 
@@ -824,7 +824,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     size_threshold = (
                         20
                         if iteration > opt.opacity_reset_interval
-                        else None
+                        else 40
                     )
 
                     old_num_gaussians = gaussians.get_xyz.shape[0]
@@ -834,7 +834,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         0.005,
                         scene.cameras_extent,
                         size_threshold,
-                        radii
+                        radii,
+                        max_num_gaussians=350000
                     )
                     if cosmos_initialized:
 

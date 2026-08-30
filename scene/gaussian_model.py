@@ -537,13 +537,14 @@ class GaussianModel:
             new_supergaussian_ids,
             new_cosmos_descriptors,
         )
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, max_num_gaussians=None):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        if max_num_gaussians is None or self.get_xyz.shape[0] < max_num_gaussians:
+            self.densify_and_clone(grads, max_grad, extent)
+            self.densify_and_split(grads, max_grad, extent)
 
         prune_mask = (self.get_opacity<min_opacity).squeeze()
         if max_screen_size:
