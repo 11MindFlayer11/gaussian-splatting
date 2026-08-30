@@ -824,7 +824,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     size_threshold = (
                         20
                         if iteration > opt.opacity_reset_interval
-                        else 40
+                        else None
                     )
 
                     old_num_gaussians = gaussians.get_xyz.shape[0]
@@ -835,7 +835,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         scene.cameras_extent,
                         size_threshold,
                         radii,
-                        max_num_gaussians=350000
+                        max_num_gaussians=300000
                     )
                     if cosmos_initialized:
 
