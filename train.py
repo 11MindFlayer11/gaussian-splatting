@@ -43,7 +43,7 @@ except:
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
-    if args.bounded:
+    if args.bounded is not None:
         bounds = np.load(args.bounds_path)
 
         bound_min = torch.tensor(
@@ -141,6 +141,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
+        if args.bounded == "soft":
+            xyz = gaussians.get_xyz
+
+            outside_min = torch.relu(bound_min - xyz)
+            outside_max = torch.relu(xyz - bound_max)
+
+            bound_loss = (
+                outside_min.square().sum(dim=1) +
+                outside_max.square().sum(dim=1)
+            ).mean()
+
+            loss = loss + 0.01 * bound_loss
+        
         # Depth regularization
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
@@ -198,7 +211,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.step(visible, radii.shape[0])   
                 else:
                     gaussians.optimizer.step()
-                if args.bounded:
+                if args.bounded=="hard":
                     with torch.no_grad():
                         gaussians._xyz.clamp_(bound_min, bound_max)
                 gaussians.optimizer.zero_grad(set_to_none = True)
@@ -285,7 +298,7 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument("--bounded", action="store_true")
+    parser.add_argument("--bounded",type=str,choices=["hard", "soft"],default=None)
     parser.add_argument("--bounds_path", type=str, default=None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
