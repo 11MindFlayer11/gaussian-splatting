@@ -23,6 +23,9 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+import numpy as np
+import torch.nn.functional as F
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -41,7 +44,99 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def compute_free_space_loss(
+    xyz,
+    distance_field,
+    bound_min,
+    bound_max
+):
+    """
+    Differentiable free-space distance-field loss.
+
+    xyz:
+        [N, 3] Gaussian centers
+
+    distance_field:
+        [1, 1, D, H, W]
+
+    Returns:
+        scalar loss
+    """
+
+    # World coordinates -> [0, 1]
+    uvw = (xyz - bound_min) / (
+        bound_max - bound_min
+    )
+
+    # [0, 1] -> [-1, 1]
+    grid = uvw * 2.0 - 1.0
+
+    # grid_sample expects:
+    # [N, D, H, W, 3]
+    grid = grid.view(
+        1,
+        -1,
+        1,
+        1,
+        3
+    )
+
+    sampled_distance = F.grid_sample(
+        distance_field,
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True
+    )
+
+    sampled_distance = sampled_distance.view(-1)
+
+    return sampled_distance.mean()
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, free_space_loss=False, free_space_field_path=None, free_space_lambda=1e-3):
+
+    free_space_distance = None
+    free_space_bound_min = None
+    free_space_bound_max = None
+
+    if free_space_loss:
+
+        if free_space_field_path is None:
+            raise ValueError(
+                "--free_space_field_path is required "
+                "when --free_space_loss is enabled"
+            )
+
+        free_data = np.load(free_space_field_path)
+
+        distance_np = free_data["distance_world"].astype(np.float32)
+
+        free_space_distance = torch.from_numpy(
+            distance_np
+        ).cuda()[None, None]
+
+        free_space_bound_min = torch.tensor(
+            free_data["bound_min"],
+            device="cuda",
+            dtype=torch.float32
+        )
+
+        free_space_bound_max = torch.tensor(
+            free_data["bound_max"],
+            device="cuda",
+            dtype=torch.float32
+        )
+
+        print(
+            "[FreeSpace] Distance field:",
+            tuple(distance_np.shape)
+        )
+
+        print(
+            "[FreeSpace] Max distance:",
+            distance_np.max()
+        )
+
 
     if args.bounded is not None:
         bounds = np.load(args.bounds_path)
@@ -168,6 +263,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
+        if args.free_space_loss:
+
+            free_space_loss = compute_free_space_loss(
+                gaussians._xyz,
+                free_space_distance,
+                free_space_bound_min,
+                free_space_bound_max
+            )
+
+            loss = loss + args.free_space_lambda * free_space_loss
+        if args.free_space_loss and iteration % 100 == 0:
+            print(
+                f"[FreeSpace] "
+                f"loss={free_space_loss.item():.8f} "
+                f"weighted={args.free_space_lambda * free_space_loss.item():.8f}"
+            )
         loss.backward()
 
         iter_end.record()
@@ -300,6 +411,25 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--bounded",type=str,choices=["hard", "soft"],default=None)
     parser.add_argument("--bounds_path", type=str, default=None)
+    parser.add_argument(
+        "--free_space_loss",
+        action="store_true",
+        help="Use differentiable free-space distance-field loss."
+    )
+
+    parser.add_argument(
+        "--free_space_field_path",
+        type=str,
+        default=None,
+        help="NPZ containing the free-space distance field."
+    )
+
+    parser.add_argument(
+        "--free_space_lambda",
+        type=float,
+        default=1e-3,
+        help="Weight of the free-space loss."
+    )
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -312,7 +442,9 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,  args.free_space_loss,
+    args.free_space_field_path,
+    args.free_space_lambda)
 
     # All done
     print("\nTraining complete.")
