@@ -50,29 +50,12 @@ def compute_free_space_loss(
     bound_min,
     bound_max
 ):
-    """
-    Differentiable free-space distance-field loss.
-
-    xyz:
-        [N, 3] Gaussian centers
-
-    distance_field:
-        [1, 1, D, H, W]
-
-    Returns:
-        scalar loss
-    """
-
-    # World coordinates -> [0, 1]
     uvw = (xyz - bound_min) / (
         bound_max - bound_min
     )
 
-    # [0, 1] -> [-1, 1]
     grid = uvw * 2.0 - 1.0
 
-    # grid_sample expects:
-    # [N, D, H, W, 3]
     grid = grid.view(
         1,
         -1,
@@ -87,24 +70,28 @@ def compute_free_space_loss(
         mode="bilinear",
         padding_mode="zeros",
         align_corners=True
-    )
+    ).view(-1)
 
-    sampled_distance = sampled_distance.view(-1)
+    free_mask = sampled_distance > 0
 
-    return sampled_distance.mean()
+    if not torch.any(free_mask):
+        return sampled_distance.sum() * 0.0
+
+    free_distance = sampled_distance[free_mask]
+
+    return free_distance.square().mean()
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, free_space_loss=False, free_space_field_path=None, free_space_lambda=1e-3):
 
     free_space_distance = None
+    free_space_mask = None
     free_space_bound_min = None
     free_space_bound_max = None
 
     if free_space_loss:
-
         if free_space_field_path is None:
             raise ValueError(
-                "--free_space_field_path is required "
-                "when --free_space_loss is enabled"
+                "free_space_field_path must be provided when free_space_loss is enabled."
             )
 
         free_data = np.load(free_space_field_path)
@@ -114,6 +101,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         free_space_distance = torch.from_numpy(
             distance_np
         ).cuda()[None, None]
+
+        free_space_mask = torch.from_numpy(
+            free_data["free_mask"].astype(bool)
+        ).cuda()
 
         free_space_bound_min = torch.tensor(
             free_data["bound_min"],
@@ -162,7 +153,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only = False)
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -308,7 +299,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii,free_space_mask=free_space_mask,bound_min=free_space_bound_min,bound_max=free_space_bound_max)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
