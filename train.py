@@ -98,9 +98,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         distance_np = free_data["distance_world"].astype(np.float32)
 
-        free_space_distance = torch.from_numpy(
-            distance_np
-        ).cuda()[None, None]
+        free_space_distance = torch.from_numpy(distance_np).cuda().permute(2, 1, 0).contiguous()[None, None]
 
         free_space_mask = torch.from_numpy(
             free_data["free_mask"].astype(bool)
