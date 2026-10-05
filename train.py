@@ -81,7 +81,202 @@ def compute_free_space_loss(
 
     return free_distance.square().mean()
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, free_space_loss=False, free_space_field_path=None, free_space_lambda=1e-3):
+def compute_adaptive_free_space_loss(
+    xyz,
+    distance_field,
+    bound_min,
+    bound_max,
+    child_indices,
+    child_distance,
+    refine_factor
+):
+    """
+    Use the coarse distance field everywhere except inside
+    refined child voxels, where the recomputed fine distance
+    is used.
+    """
+
+    # --------------------------------------------------------
+    # Coarse normalized coordinates
+    # --------------------------------------------------------
+
+    uvw = (
+        xyz - bound_min
+    ) / (
+        bound_max - bound_min
+    )
+
+    grid = uvw * 2.0 - 1.0
+
+    grid = grid.view(
+        1,
+        -1,
+        1,
+        1,
+        3
+    )
+
+    # --------------------------------------------------------
+    # Coarse distance
+    # --------------------------------------------------------
+
+    coarse_distance = F.grid_sample(
+        distance_field,
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True
+    ).view(-1)
+
+    # --------------------------------------------------------
+    # Convert Gaussian positions to global fine-grid indices
+    # --------------------------------------------------------
+
+    coarse_shape = torch.tensor(
+        distance_field.shape[2:],
+        device=xyz.device,
+        dtype=xyz.dtype
+    )
+
+    fine_shape = (
+        coarse_shape * refine_factor
+    )
+
+    fine_coord = torch.floor(
+        uvw * fine_shape
+    ).long()
+
+    fine_coord = torch.clamp(
+        fine_coord,
+        min=0
+    )
+
+    fine_coord = torch.minimum(
+        fine_coord,
+        fine_shape.long() - 1
+    )
+
+    # --------------------------------------------------------
+    # Convert child coordinates -> unique integer keys
+    # --------------------------------------------------------
+
+    fine_y = fine_shape[1].long()
+    fine_z = fine_shape[2].long()
+
+    child_key = (
+        child_indices[:, 0]
+        * fine_y
+        * fine_z
+        +
+        child_indices[:, 1]
+        * fine_z
+        +
+        child_indices[:, 2]
+    )
+
+    point_key = (
+        fine_coord[:, 0]
+        * fine_y
+        * fine_z
+        +
+        fine_coord[:, 1]
+        * fine_z
+        +
+        fine_coord[:, 2]
+    )
+
+    # --------------------------------------------------------
+    # Fast child lookup
+    # --------------------------------------------------------
+
+    sorted_keys, order = torch.sort(
+        child_key
+    )
+
+    positions = torch.searchsorted(
+        sorted_keys,
+        point_key
+    )
+
+    valid = (
+        positions
+        < sorted_keys.numel()
+    )
+
+    refined_mask = torch.zeros(
+        xyz.shape[0],
+        dtype=torch.bool,
+        device=xyz.device
+    )
+
+    refined_distance = torch.zeros(
+        xyz.shape[0],
+        dtype=torch.float32,
+        device=xyz.device
+    )
+
+    if torch.any(valid):
+
+        valid_idx = torch.nonzero(
+            valid,
+            as_tuple=False
+        ).squeeze(1)
+
+        matched = (
+            sorted_keys[
+                positions[valid_idx]
+            ]
+            ==
+            point_key[valid_idx]
+        )
+
+        matched_idx = valid_idx[
+            matched
+        ]
+
+        child_pos = order[
+            positions[matched_idx]
+        ]
+
+        refined_mask[
+            matched_idx
+        ] = True
+
+        refined_distance[
+            matched_idx
+        ] = child_distance[
+            child_pos
+        ]
+
+    # --------------------------------------------------------
+    # Fine distance inside refined children,
+    # coarse distance everywhere else
+    # --------------------------------------------------------
+
+    sampled_distance = torch.where(
+        refined_mask,
+        refined_distance,
+        coarse_distance
+    )
+
+    free_mask = (
+        sampled_distance > 0
+    )
+
+    if not torch.any(free_mask):
+        return (
+            sampled_distance.sum()
+            * 0.0
+        )
+
+    free_distance = (
+        sampled_distance[free_mask]
+    )
+
+    return (
+        free_distance.square().mean()
+    )
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, free_space_loss=False, free_space_field_path=None, free_space_lambda=1e-3, adaptive_free_space=False):
 
     free_space_distance = None
     free_space_mask = None
@@ -97,6 +292,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         free_data = np.load(free_space_field_path)
 
         distance_np = free_data["distance_world"].astype(np.float32)
+
+        adaptive_child_indices = None
+        adaptive_child_distance = None
+        adaptive_refine_factor = None
+
+        if adaptive_free_space:
+
+            adaptive_child_indices = torch.from_numpy(
+                free_data["child_indices"].astype(np.int64)
+            ).cuda()
+
+            adaptive_child_distance = torch.from_numpy(
+                free_data["child_distance"].astype(np.float32)
+            ).cuda()
+
+            adaptive_refine_factor = int(
+                free_data["refine_factor"]
+            )
+
+            print(
+                "[FreeSpace] Adaptive children:",
+                adaptive_child_indices.shape[0]
+            )
+
+            print(
+                "[FreeSpace] Max child distance:",
+                adaptive_child_distance.max().item()
+                if adaptive_child_distance.numel() > 0
+                else 0.0
+            )
 
         free_space_distance = torch.from_numpy(distance_np).cuda().permute(2, 1, 0).contiguous()[None, None]
 
@@ -254,14 +479,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         if args.free_space_loss:
 
-            free_space_loss = compute_free_space_loss(
-                gaussians._xyz,
-                free_space_distance,
-                free_space_bound_min,
-                free_space_bound_max
-            )
+            if adaptive_free_space:
 
-            loss = loss + args.free_space_lambda * free_space_loss
+                free_space_loss = compute_adaptive_free_space_loss(
+                    gaussians._xyz,
+                    free_space_distance,
+                    free_space_bound_min,
+                    free_space_bound_max,
+                    adaptive_child_indices,
+                    adaptive_child_distance,
+                    adaptive_refine_factor
+                )
+
+            else:
+
+                free_space_loss = compute_free_space_loss(
+                    gaussians._xyz,
+                    free_space_distance,
+                    free_space_bound_min,
+                    free_space_bound_max
+                )
+
+            loss = (
+                loss
+                + args.free_space_lambda * free_space_loss
+            )
         if args.free_space_loss and iteration % 100 == 0:
             print(
                 f"[FreeSpace] "
@@ -419,6 +661,10 @@ if __name__ == "__main__":
         default=1e-3,
         help="Weight of the free-space loss."
     )
+    parser.add_argument(
+    "--adaptive_free_space",
+    action="store_true",
+    help="Use adaptive free-space discretization")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -433,7 +679,7 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from,  args.free_space_loss,
     args.free_space_field_path,
-    args.free_space_lambda)
+    args.free_space_lambda, args.adaptive_free_space)
 
     # All done
     print("\nTraining complete.")

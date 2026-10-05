@@ -676,6 +676,234 @@ def generate_adaptive_children(
 
 
 # ============================================================
+# FINE CHILD DISTANCE FIELD
+# ============================================================
+
+def compute_child_distances(
+    child_indices,
+    refine_parent_voxels,
+    free_mask,
+    bound_min,
+    voxel_size,
+    fine_voxel_size,
+    refine_factor
+):
+    """
+    Recompute distances at the fine child resolution.
+
+    For each refined parent voxel:
+      - create a local fine-resolution neighborhood
+      - inherit coarse free-space information from neighboring
+        parent voxels
+      - overwrite the refined parent with the fine child
+        ray-evidence mask
+      - compute a fine-resolution EDT
+      - extract distances for surviving child voxels
+    """
+
+    if len(child_indices) == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    child_distance = np.zeros(
+        len(child_indices),
+        dtype=np.float32
+    )
+
+    child_lookup = {
+        tuple(idx): i
+        for i, idx in enumerate(child_indices)
+    }
+
+    child_parent_map = {}
+
+    for idx in child_indices:
+
+        parent_idx = tuple(
+            (idx // refine_factor).astype(np.int32)
+        )
+
+        child_parent_map.setdefault(
+            parent_idx,
+            []
+        ).append(idx)
+
+    grid_shape = np.array(free_mask.shape)
+
+    # Local context around each refined parent.
+    # One parent voxel on each side gives a 3x3x3 parent region.
+    LOCAL_RADIUS = 1
+
+    for parent in tqdm(
+        refine_parent_voxels,
+        desc="Computing fine child distances"
+    ):
+
+        px, py, pz = parent
+
+        # ----------------------------------------------------
+        # Local parent-grid bounds
+        # ----------------------------------------------------
+
+        pmin = np.maximum(
+            np.array(parent) - LOCAL_RADIUS,
+            0
+        )
+
+        pmax = np.minimum(
+            np.array(parent) + LOCAL_RADIUS + 1,
+            grid_shape
+        )
+
+        local_parent_shape = pmax - pmin
+
+        # ----------------------------------------------------
+        # Convert local parent region to fine resolution
+        # ----------------------------------------------------
+
+        local_fine_shape = (
+            local_parent_shape * refine_factor
+        )
+
+        local_free = np.zeros(
+            tuple(local_fine_shape),
+            dtype=bool
+        )
+
+        # ----------------------------------------------------
+        # Upsample coarse free-space information
+        # ----------------------------------------------------
+
+        for lx in range(local_parent_shape[0]):
+            for ly in range(local_parent_shape[1]):
+                for lz in range(local_parent_shape[2]):
+
+                    gx = pmin[0] + lx
+                    gy = pmin[1] + ly
+                    gz = pmin[2] + lz
+
+                    if free_mask[gx, gy, gz]:
+
+                        fx = lx * refine_factor
+                        fy = ly * refine_factor
+                        fz = lz * refine_factor
+
+                        local_free[
+                            fx:fx + refine_factor,
+                            fy:fy + refine_factor,
+                            fz:fz + refine_factor
+                        ] = True
+
+        # ----------------------------------------------------
+        # Replace the refined parent with its fine ray evidence
+        # ----------------------------------------------------
+
+        parent_children = child_parent_map.get(
+            tuple(parent),
+            []
+        )
+
+        # The refined parent itself was marked as surface in
+        # the coarse grid, so first clear its fine cells.
+        center_start = (
+            (np.array(parent) - pmin)
+            * refine_factor
+        )
+
+        cx, cy, cz = center_start
+
+        local_free[
+            cx:cx + refine_factor,
+            cy:cy + refine_factor,
+            cz:cz + refine_factor
+        ] = False
+
+        # Now insert fine child ray evidence.
+        for idx in parent_children:
+
+            lx = (
+                idx[0]
+                - pmin[0] * refine_factor
+            )
+            ly = (
+                idx[1]
+                - pmin[1] * refine_factor
+            )
+            lz = (
+                idx[2]
+                - pmin[2] * refine_factor
+            )
+
+            if (
+                0 <= lx < local_fine_shape[0]
+                and
+                0 <= ly < local_fine_shape[1]
+                and
+                0 <= lz < local_fine_shape[2]
+            ):
+                local_free[lx, ly, lz] = True
+
+        # ----------------------------------------------------
+        # Fine-resolution Euclidean distance transform
+        # ----------------------------------------------------
+
+        local_distance = distance_transform_edt(
+            local_free,
+            sampling=fine_voxel_size
+        ).astype(np.float32)
+
+        # ----------------------------------------------------
+        # Extract distance for surviving children
+        # ----------------------------------------------------
+
+        for idx in parent_children:
+
+            lx = (
+                idx[0]
+                - pmin[0] * refine_factor
+            )
+            ly = (
+                idx[1]
+                - pmin[1] * refine_factor
+            )
+            lz = (
+                idx[2]
+                - pmin[2] * refine_factor
+            )
+
+            child_id = child_lookup[
+                tuple(idx)
+            ]
+
+            child_distance[child_id] = (
+                local_distance[lx, ly, lz]
+            )
+
+    return child_distance
+
+
+child_distance = compute_child_distances(child_indices, refine_parent_voxels,
+    free_mask,
+    bound_min,
+    voxel_size,
+    fine_voxel_size,
+    REFINE_FACTOR
+)
+
+print(
+    "Maximum child distance:",
+    child_distance.max()
+    if len(child_distance) > 0
+    else 0.0
+)
+
+print(
+    "Mean child distance:",
+    child_distance.mean()
+    if len(child_distance) > 0
+    else 0.0
+)
+
+# ============================================================
 # 9. FIELD GENERATION PIPELINE
 # ============================================================
 
@@ -798,6 +1026,27 @@ def build_free_space_field():
         voxel_size,
         FREE_SPACE_THRESHOLD
     )
+    # ---------------------------------------------------------
+    # Compute distance for adaptive child voxels
+    # ---------------------------------------------------------
+
+    child_distance = np.zeros(
+        len(child_indices),
+        dtype=np.float32
+    )
+
+    for i, idx in enumerate(child_indices):
+        parent_idx = idx // REFINE_FACTOR
+
+        # Corresponding coarse-grid distance
+        px, py, pz = parent_idx
+
+        if (
+            0 <= px < distance_world.shape[0]
+            and 0 <= py < distance_world.shape[1]
+            and 0 <= pz < distance_world.shape[2]
+        ):
+            child_distance[i] = distance_world[px, py, pz]
 
     # --------------------------------------------------------
     # SAVE
@@ -823,10 +1072,11 @@ def build_free_space_field():
 
         threshold=FREE_SPACE_THRESHOLD,
 
-        # Adaptive field
+        # Adaptive refinement
         refine_parent_voxels=refine_parent_voxels,
         child_indices=child_indices,
-        child_ray_count=child_ray_count,
+        child_ray_count=child_counts,
+        child_distance=child_distance,
         fine_voxel_size=fine_voxel_size,
         neighbor_radius=NEIGHBOR_RADIUS,
         refine_factor=REFINE_FACTOR
