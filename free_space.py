@@ -12,6 +12,15 @@ from tqdm.auto import tqdm
 # ============================================================
 parser = argparse.ArgumentParser()
 parser.add_argument("-s", "--source_path", required=True)
+parser.add_argument("-o", "--output_path", default=None)
+parser.add_argument("--base_resolution", type=int, default=128)
+parser.add_argument("--expansion_factor", type=float, default=2.0)
+parser.add_argument("--free_space_threshold", type=int, default=1)
+parser.add_argument("--confidence_saturation", type=int, default=105)
+parser.add_argument("--ray_step_factor", type=float, default=0.75)
+parser.add_argument("--neighbor_radius", type=int, default=0)
+parser.add_argument("--refine_factor", type=int, default=2)
+parser.add_argument("--local_radius", type=int, default=1)
 args = parser.parse_args()
 
 SCENE_DIR = os.path.normpath(args.source_path)
@@ -19,16 +28,16 @@ SPARSE_DIR = os.path.join(SCENE_DIR, "dense", "sparse", "0")
 POINTS_PATH = os.path.join(SPARSE_DIR, "points3D.bin")
 IMAGES_PATH = os.path.join(SPARSE_DIR, "images.bin")
 COLMAP_PLY = os.path.join(SPARSE_DIR, "points3D.ply")
-OUTPUT_PATH = os.path.join(SCENE_DIR, "free_space_field.npz")
+OUTPUT_PATH = args.output_path if args.output_path is not None else os.path.join(SCENE_DIR, "free_space_field.npz")
 
-BASE_RESOLUTION = 128
-EXPANSION_FACTOR = 2.0
-FREE_SPACE_THRESHOLD = 1
-CONFIDENCE_SATURATION = 105
-RAY_STEP_FACTOR = 0.75
-NEIGHBOR_RADIUS = 0
-REFINE_FACTOR = 2
-LOCAL_RADIUS = 1
+BASE_RESOLUTION = args.base_resolution
+EXPANSION_FACTOR = args.expansion_factor
+FREE_SPACE_THRESHOLD = args.free_space_threshold
+CONFIDENCE_SATURATION = args.confidence_saturation
+RAY_STEP_FACTOR = args.ray_step_factor
+NEIGHBOR_RADIUS = args.neighbor_radius
+REFINE_FACTOR = args.refine_factor
+LOCAL_RADIUS = args.local_radius
 
 # ============================================================
 # 2. COLMAP POINT / CAMERA LOADING
