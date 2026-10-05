@@ -88,7 +88,8 @@ def compute_adaptive_free_space_loss(
     bound_max,
     child_indices,
     child_distance,
-    refine_factor
+    refine_factor,
+    grid_resolution
 ):
     """
     Use the coarse distance field everywhere except inside
@@ -104,6 +105,11 @@ def compute_adaptive_free_space_loss(
         xyz - bound_min
     ) / (
         bound_max - bound_min
+    )
+    inside_field = (
+        (uvw[:, 0] >= 0) & (uvw[:, 0] <= 1) &
+        (uvw[:, 1] >= 0) & (uvw[:, 1] <= 1) &
+        (uvw[:, 2] >= 0) & (uvw[:, 2] <= 1)
     )
 
     grid = uvw * 2.0 - 1.0
@@ -132,15 +138,7 @@ def compute_adaptive_free_space_loss(
     # Convert Gaussian positions to global fine-grid indices
     # --------------------------------------------------------
 
-    coarse_shape = torch.tensor(
-        distance_field.shape[2:],
-        device=xyz.device,
-        dtype=xyz.dtype
-    )
-
-    fine_shape = (
-        coarse_shape * refine_factor
-    )
+    fine_shape = grid_resolution.to(xyz.device) * refine_factor
 
     fine_coord = torch.floor(
         uvw * fine_shape
@@ -199,9 +197,9 @@ def compute_adaptive_free_space_loss(
     )
 
     valid = (
-        positions
-        < sorted_keys.numel()
-    )
+            (positions < sorted_keys.numel()) &
+            inside_field
+        )
 
     refined_mask = torch.zeros(
         xyz.shape[0],
@@ -282,6 +280,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     free_space_mask = None
     free_space_bound_min = None
     free_space_bound_max = None
+    free_space_grid_resolution = None
 
     if free_space_loss:
         if free_space_field_path is None:
@@ -310,6 +309,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             adaptive_refine_factor = int(
                 free_data["refine_factor"]
             )
+            free_space_grid_resolution = torch.from_numpy(free_data["grid_resolution"].astype(np.int64)).cuda()
 
             print(
                 "[FreeSpace] Adaptive children:",
@@ -488,7 +488,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     free_space_bound_max,
                     adaptive_child_indices,
                     adaptive_child_distance,
-                    adaptive_refine_factor
+                    adaptive_refine_factor,
+                    free_space_grid_resolution
                 )
 
             else:
