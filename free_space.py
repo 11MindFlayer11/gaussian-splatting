@@ -1030,23 +1030,29 @@ def build_free_space_field():
     # Compute distance for adaptive child voxels
     # ---------------------------------------------------------
 
-    child_distance = np.zeros(
-        len(child_indices),
-        dtype=np.float32
+    child_distance = compute_child_distances(
+        child_indices,
+        refine_parent_voxels,
+        free_mask,
+        bound_min,
+        voxel_size,
+        fine_voxel_size,
+        REFINE_FACTOR
     )
 
-    for i, idx in enumerate(child_indices):
-        parent_idx = idx // REFINE_FACTOR
+    print(
+        "Maximum child distance:",
+        child_distance.max()
+        if len(child_distance) > 0
+        else 0.0
+    )
 
-        # Corresponding coarse-grid distance
-        px, py, pz = parent_idx
-
-        if (
-            0 <= px < distance_world.shape[0]
-            and 0 <= py < distance_world.shape[1]
-            and 0 <= pz < distance_world.shape[2]
-        ):
-            child_distance[i] = distance_world[px, py, pz]
+    print(
+        "Mean child distance:",
+        child_distance.mean()
+        if len(child_distance) > 0
+        else 0.0
+    )
 
     # --------------------------------------------------------
     # SAVE
