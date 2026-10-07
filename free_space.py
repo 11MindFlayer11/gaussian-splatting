@@ -18,7 +18,7 @@ parser.add_argument("--expansion_factor", type=float, default=2.0)
 parser.add_argument("--free_space_threshold", type=int, default=1)
 parser.add_argument("--confidence_saturation", type=int, default=105)
 parser.add_argument("--ray_step_factor", type=float, default=0.75)
-parser.add_argument("--neighbor_radius", type=int, default=0)
+parser.add_argument("--neighbor_radius", type=int, default=None)
 parser.add_argument("--refine_factor", type=int, default=2)
 parser.add_argument("--local_radius", type=int, default=1)
 args = parser.parse_args()
@@ -388,15 +388,23 @@ def build_free_space_field():
     print("\nComputing distance field...")
     distance_world, confidence = compute_distance_and_confidence(ray_count, free_mask, voxel_size)
 
-    print("\nGenerating adaptive refinement...")
-    refine_parent_voxels, child_indices, child_ray_count, fine_voxel_size = generate_adaptive_children(
-        points, images, colmap_xyz, bound_min, grid_resolution, voxel_size, FREE_SPACE_THRESHOLD
-    )
+    if NEIGHBOR_RADIUS is not None:
+        print("\nGenerating adaptive refinement...")
+        refine_parent_voxels, child_indices, child_ray_count, fine_voxel_size = generate_adaptive_children(
+            points, images, colmap_xyz, bound_min, grid_resolution, voxel_size, FREE_SPACE_THRESHOLD
+        )
 
-    print("\nComputing fine child distances...")
-    child_distance = compute_child_distances(
-        child_indices, refine_parent_voxels, colmap_xyz, bound_min, fine_voxel_size, REFINE_FACTOR, grid_resolution
-    )
+        print("\nComputing fine child distances...")
+        child_distance = compute_child_distances(
+            child_indices, refine_parent_voxels, colmap_xyz, bound_min,s
+            fine_voxel_size, REFINE_FACTOR, grid_resolution
+        )
+    else:
+        refine_parent_voxels = np.empty((0, 3), dtype=np.int32)
+        child_indices = np.empty((0, 3), dtype=np.int32)
+        child_ray_count = np.empty((0,), dtype=np.uint16)
+        child_distance = np.empty((0,), dtype=np.float32)
+        fine_voxel_size = np.zeros(3, dtype=np.float64)
     print("Maximum child distance:", child_distance.max() if len(child_distance) > 0 else 0.0)
     print("Mean child distance:", child_distance.mean() if len(child_distance) > 0 else 0.0)
 
