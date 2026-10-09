@@ -69,7 +69,7 @@ def compute_free_space_loss(
         grid,
         mode="bilinear",
         padding_mode="zeros",
-        align_corners=True
+        align_corners=False
     ).view(-1)
 
     free_mask = sampled_distance > 0
@@ -131,7 +131,7 @@ def compute_adaptive_free_space_loss(
         grid,
         mode="bilinear",
         padding_mode="zeros",
-        align_corners=True
+        align_corners=False
     ).view(-1)
 
     # --------------------------------------------------------
@@ -253,7 +253,7 @@ def compute_adaptive_free_space_loss(
 
     sampled_distance = torch.where(
         refined_mask,
-        refined_distance,
+        refined_distance + (coarse_distance - coarse_distance.detach()),
         coarse_distance
     )
 

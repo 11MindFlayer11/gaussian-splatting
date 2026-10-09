@@ -4,8 +4,9 @@ import argparse
 import numpy as np
 from scipy.spatial.transform import Rotation
 from scipy.ndimage import distance_transform_edt
+from scipy.spatial import cKDTree
 from plyfile import PlyData
-from tqdm.auto import tqdm
+from scipy.ndimage import binary_dilation
 
 # ============================================================
 # 1. ARGUMENTS / PATHS / SETTINGS
@@ -20,7 +21,8 @@ parser.add_argument("--confidence_saturation", type=int, default=105)
 parser.add_argument("--ray_step_factor", type=float, default=0.75)
 parser.add_argument("--neighbor_radius", type=int, default=None)
 parser.add_argument("--refine_factor", type=int, default=2)
-parser.add_argument("--local_radius", type=int, default=1)
+parser.add_argument("--local_radius", type=int, default=1)   # unused now (kept for CLI compatibility)
+parser.add_argument("--surface_margin", type=int, default=0)
 args = parser.parse_args()
 
 SCENE_DIR = os.path.normpath(args.source_path)
@@ -38,6 +40,7 @@ RAY_STEP_FACTOR = args.ray_step_factor
 NEIGHBOR_RADIUS = args.neighbor_radius
 REFINE_FACTOR = args.refine_factor
 LOCAL_RADIUS = args.local_radius
+SURFACE_MARGIN = args.surface_margin
 
 # ============================================================
 # 2. COLMAP POINT / CAMERA LOADING
@@ -117,54 +120,77 @@ def compute_bounds(points_xyz):
     return bound_min, bound_max, grid_resolution, voxel_size
 
 # ============================================================
-# 4. COARSE FREE-SPACE RAY GENERATION
+# 4. VECTORIZED RAY HELPERS
+# ============================================================
+def build_rays(points, images, dedupe=False):
+    """Flatten every (3D point, observing camera) pair into arrays: camera centers, directions, lengths."""
+    P, C = [], []
+    for p in points.values():
+        ids = set(p["image_ids"]) if dedupe else p["image_ids"]
+        for i in ids:
+            if i in images:
+                P.append(p["xyz"])
+                C.append(images[i]["camera_center"])
+    if len(P) == 0:
+        return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0,))
+    P, C = np.asarray(P), np.asarray(C)
+    d = P - C
+    return C, d, np.linalg.norm(d, axis=1)
+
+def iter_ray_samples(C, d, L, step, chunk=2000):
+    """
+    Yield (ray_id, sample_xyz) for chunks of rays. Samples are t = k/n for k in [0, n),
+    n = ceil(L/step), identical to the original per-ray np.arange(n)/n. ray_id is local to the chunk.
+    """
+    n = np.ceil(L / step).astype(np.int64)
+    ok = np.where((L > 1e-8) & (n > 1))[0]
+    for s in range(0, len(ok), chunk):
+        r = ok[s:s + chunk]
+        nr = n[r]
+        rid = np.repeat(np.arange(len(r)), nr)
+        k = np.arange(nr.sum()) - np.repeat(np.cumsum(nr) - nr, nr)
+        t = k / nr[rid]
+        yield rid, C[r][rid] + t[:, None] * d[r][rid]
+
+# ============================================================
+# 5. COARSE FREE-SPACE RAY GENERATION
 # ============================================================
 def generate_ray_count(points, images, bound_min, bound_max, grid_resolution, voxel_size):
-    NX, NY, NZ = grid_resolution
-    ray_count = np.zeros((NX, NY, NZ), dtype=np.uint16)
-    step_size = voxel_size.min() * RAY_STEP_FACTOR
-    print("\nGrid:", ray_count.shape)
-    print("Voxel size:", voxel_size)
-    print("Step size:", step_size)
-    total_rays = 0
+    grid = np.asarray(grid_resolution, dtype=np.int64)
+    V = int(grid.prod())
+    C, d, L = build_rays(points, images)
+    step = voxel_size.min() * RAY_STEP_FACTOR
+    ray_count = np.zeros(V, dtype=np.int64)
     valid_rays = 0
 
-    for _, point_data in tqdm(points.items(), desc="Generating rays"):
-        P = point_data["xyz"]
-        for image_id in point_data["image_ids"]:
-            if image_id not in images:
-                continue
-            C = images[image_id]["camera_center"]
-            direction = P - C
-            ray_length = np.linalg.norm(direction)
-            if ray_length < 1e-8:
-                continue
-            total_rays += 1
-            num_steps = int(np.ceil(ray_length / step_size))
-            if num_steps <= 1:
-                continue
-            t_values = np.arange(num_steps) / num_steps
-            samples = C[None, :] + t_values[:, None] * direction[None, :]
-            ijk = np.floor((samples - bound_min) / voxel_size).astype(np.int32)
-            inside = ((ijk[:, 0] >= 0) & (ijk[:, 0] < NX) &
-                      (ijk[:, 1] >= 0) & (ijk[:, 1] < NY) &
-                      (ijk[:, 2] >= 0) & (ijk[:, 2] < NZ))
-            ijk = ijk[inside]
-            if len(ijk) == 0:
-                continue
-            valid_rays += 1
-            ijk = np.unique(ijk, axis=0)
-            np.add.at(ray_count, (ijk[:, 0], ijk[:, 1], ijk[:, 2]), 1)
+    print("\nGrid:", tuple(grid))
+    print("Voxel size:", voxel_size)
+    print("Step size:", step)
+    print("Rays:", len(L))
+
+    for rid, samples in iter_ray_samples(C, d, L, step):
+        ijk = np.floor((samples - bound_min) / voxel_size).astype(np.int64)
+        inside = np.all((ijk >= 0) & (ijk < grid), axis=1)
+        ijk, rid = ijk[inside], rid[inside]
+        if len(ijk) == 0:
+            continue
+        lin = (ijk[:, 0] * grid[1] + ijk[:, 1]) * grid[2] + ijk[:, 2]
+        key = np.unique(rid * V + lin)              # one hit per (ray, voxel)
+        valid_rays += len(np.unique(key // V))
+        u, c = np.unique(key % V, return_counts=True)
+        ray_count[u] += c
+
+    ray_count = ray_count.reshape(tuple(grid)).astype(np.uint16)
 
     print("\nRay generation complete.")
-    print("Total rays:", total_rays)
+    print("Total rays:", int((L >= 1e-8).sum()))
     print("Valid rays:", valid_rays)
     print("Nonzero voxels:", np.count_nonzero(ray_count))
     print("Maximum ray count:", ray_count.max())
     return ray_count
 
 # ============================================================
-# 5. SURFACE / FREE / UNKNOWN CLASSIFICATION
+# 6. SURFACE / FREE / UNKNOWN CLASSIFICATION
 # ============================================================
 def build_masks(ray_count, colmap_xyz, bound_min, bound_max):
     grid_shape = np.array(ray_count.shape)
@@ -180,7 +206,7 @@ def build_masks(ray_count, colmap_xyz, bound_min, bound_max):
     return free_mask, surface_mask, unknown_mask, voxel_indices, voxel_size
 
 # ============================================================
-# 6. COARSE DISTANCE FIELD / CONFIDENCE
+# 7. COARSE DISTANCE FIELD / CONFIDENCE
 # ============================================================
 def compute_distance_and_confidence(ray_count, free_mask, voxel_size):
     distance_world = distance_transform_edt(free_mask, sampling=voxel_size).astype(np.float32)
@@ -190,7 +216,7 @@ def compute_distance_and_confidence(ray_count, free_mask, voxel_size):
     return distance_world, confidence
 
 # ============================================================
-# 7. ADAPTIVE PARENT SELECTION
+# 8. ADAPTIVE PARENT SELECTION
 # ============================================================
 def expand_voxel_neighborhood(voxel_indices, radius, grid_shape):
     if radius == 0:
@@ -205,21 +231,24 @@ def expand_voxel_neighborhood(voxel_indices, radius, grid_shape):
     return np.unique(expanded[valid], axis=0)
 
 # ============================================================
-# 8. ADAPTIVE CHILD RAY EVIDENCE
+# 9. ADAPTIVE CHILD RAY EVIDENCE
 # ============================================================
 def generate_adaptive_children(points, images, colmap_xyz, bound_min, grid_resolution, voxel_size, threshold):
-    NX, NY, NZ = grid_resolution
-    point_ijk = np.floor((colmap_xyz - bound_min) / voxel_size).astype(np.int32)
-    point_ijk[:, 0] = np.clip(point_ijk[:, 0], 0, NX - 1)
-    point_ijk[:, 1] = np.clip(point_ijk[:, 1], 0, NY - 1)
-    point_ijk[:, 2] = np.clip(point_ijk[:, 2], 0, NZ - 1)
+    grid = np.asarray(grid_resolution, dtype=np.int64)
+    point_ijk = np.floor((colmap_xyz - bound_min) / voxel_size).astype(np.int64)
+    point_ijk = np.clip(point_ijk, 0, grid - 1)
     surface_parent_voxels = np.unique(point_ijk, axis=0)
-    refine_parent_voxels = expand_voxel_neighborhood(surface_parent_voxels, NEIGHBOR_RADIUS, (NX, NY, NZ))
-    refine_parent_set = {tuple(v) for v in refine_parent_voxels}
+    refine_parent_voxels = expand_voxel_neighborhood(surface_parent_voxels, NEIGHBOR_RADIUS, tuple(grid))
+
+    # boolean mask replaces the python set of tuples
+    refine_mask = np.zeros(tuple(grid), dtype=bool)
+    refine_mask[tuple(refine_parent_voxels.T)] = True
+
     fine_voxel_size = voxel_size / REFINE_FACTOR
-    step_size_fine = fine_voxel_size.min() * RAY_STEP_FACTOR
-    fine_shape = np.asarray(grid_resolution, dtype=np.int32) * REFINE_FACTOR
-    child_ray_count = {}
+    step = fine_voxel_size.min() * RAY_STEP_FACTOR
+    fine = grid * REFINE_FACTOR
+    FV = int(fine.prod())
+    C, d, L = build_rays(points, images, dedupe=True)
 
     print("\nAdaptive refinement")
     print("-------------------")
@@ -228,64 +257,50 @@ def generate_adaptive_children(points, images, colmap_xyz, bound_min, grid_resol
     print("Neighbor radius:", NEIGHBOR_RADIUS)
     print("Children per parent:", REFINE_FACTOR ** 3)
     print("Fine voxel size:", fine_voxel_size)
-    print("Fine ray step:", step_size_fine)
+    print("Fine ray step:", step)
+    print("Rays:", len(L))
 
-    for _, point_data in tqdm(points.items(), desc="Adaptive ray rasterization"):
-        P = point_data["xyz"]
-        for image_id in set(point_data["image_ids"]):
-            if image_id not in images:
-                continue
-            C = images[image_id]["camera_center"]
-            ray = P - C
-            ray_length = np.linalg.norm(ray)
-            if ray_length <= 1e-8:
-                continue
-            num_steps = int(np.ceil(ray_length / step_size_fine))
-            if num_steps <= 1:
-                continue
-            t_values = np.arange(num_steps, dtype=np.float32) / num_steps
-            samples = C[None, :] + t_values[:, None] * ray[None, :]
-            parent_ijk = np.floor((samples - bound_min) / voxel_size).astype(np.int32)
-            inside = ((parent_ijk[:, 0] >= 0) & (parent_ijk[:, 0] < NX) &
-                      (parent_ijk[:, 1] >= 0) & (parent_ijk[:, 1] < NY) &
-                      (parent_ijk[:, 2] >= 0) & (parent_ijk[:, 2] < NZ))
-            parent_ijk = parent_ijk[inside]
-            samples = samples[inside]
-            if len(parent_ijk) == 0:
-                continue
-            keep = np.array([tuple(v) in refine_parent_set for v in parent_ijk])
-            if not np.any(keep):
-                continue
-            samples = samples[keep]
-            child_ijk = np.floor((samples - bound_min) / fine_voxel_size).astype(np.int32)
-            valid_child = ((child_ijk[:, 0] >= 0) & (child_ijk[:, 0] < fine_shape[0]) &
-                           (child_ijk[:, 1] >= 0) & (child_ijk[:, 1] < fine_shape[1]) &
-                           (child_ijk[:, 2] >= 0) & (child_ijk[:, 2] < fine_shape[2]))
-            child_ijk = child_ijk[valid_child]
-            if len(child_ijk) == 0:
-                continue
-            child_ijk = np.unique(child_ijk, axis=0)
-            for idx in child_ijk:
-                key = tuple(idx)
-                child_ray_count[key] = child_ray_count.get(key, 0) + 1
+    all_lin, all_cnt = [], []
+    for rid, samples in iter_ray_samples(C, d, L, step):
+        parent = np.floor((samples - bound_min) / voxel_size).astype(np.int64)
+        inside = np.all((parent >= 0) & (parent < grid), axis=1)
+        parent, samples, rid = parent[inside], samples[inside], rid[inside]
+        if len(parent) == 0:
+            continue
+        keep = refine_mask[parent[:, 0], parent[:, 1], parent[:, 2]]
+        samples, rid = samples[keep], rid[keep]
+        if len(samples) == 0:
+            continue
 
-    child_indices = []
-    child_counts = []
-    for idx, count in child_ray_count.items():
-        if count >= threshold:
-            child_indices.append(idx)
-            child_counts.append(count)
+        child = np.floor((samples - bound_min) / fine_voxel_size).astype(np.int64)
+        ok = np.all((child >= 0) & (child < fine), axis=1)
+        child, rid = child[ok], rid[ok]
+        if len(child) == 0:
+            continue
+        lin = (child[:, 0] * fine[1] + child[:, 1]) * fine[2] + child[:, 2]
+        key = np.unique(rid * FV + lin)              # one hit per (ray, child voxel)
+        u, c = np.unique(key % FV, return_counts=True)
+        all_lin.append(u)
+        all_cnt.append(c)
 
-    if child_indices:
-        child_indices = np.asarray(child_indices, dtype=np.int32)
-        child_counts = np.asarray(child_counts, dtype=np.uint16)
+    if all_lin:
+        all_lin = np.concatenate(all_lin)
+        all_cnt = np.concatenate(all_cnt)
+        u, inv = np.unique(all_lin, return_inverse=True)
+        counts = np.bincount(inv.ravel(), weights=all_cnt).astype(np.int64)
+        n_any = len(u)
+        m = counts >= threshold
+        u, counts = u[m], counts[m]
+        child_indices = np.stack(np.unravel_index(u, tuple(int(x) for x in fine)), axis=1).astype(np.int32)
+        child_counts = counts.astype(np.uint16)
     else:
+        n_any = 0
         child_indices = np.empty((0, 3), dtype=np.int32)
         child_counts = np.empty((0,), dtype=np.uint16)
 
     print("\nChild voxel statistics")
     print("----------------------")
-    print("Children with any ray evidence:", len(child_ray_count))
+    print("Children with any ray evidence:", n_any)
     print("Children passing threshold:", len(child_indices))
     if len(child_counts) > 0:
         print("Maximum child ray count:", child_counts.max())
@@ -295,69 +310,30 @@ def generate_adaptive_children(points, images, colmap_xyz, bound_min, grid_resol
     return refine_parent_voxels, child_indices, child_counts, fine_voxel_size
 
 # ============================================================
-# 9. FINE CHILD DISTANCE FIELD
+# 10. FINE CHILD DISTANCE FIELD
 # ============================================================
-def compute_child_distances(child_indices, refine_parent_voxels, colmap_xyz, bound_min, fine_voxel_size, refine_factor, grid_shape):
+def compute_child_distances(child_indices, refine_parent_voxels, colmap_xyz, bound_min,
+                            fine_voxel_size, refine_factor, grid_shape):
+    """
+    Distance from each surviving child voxel to the nearest fine-resolution COLMAP surface voxel,
+    in world units. One KD-tree query replaces the per-parent EDT loop. Unlike the windowed EDT,
+    this is not limited to a (2*LOCAL_RADIUS+1)^3 parent window.
+    """
     if len(child_indices) == 0:
         return np.zeros(0, dtype=np.float32)
 
-    child_distance = np.zeros(len(child_indices), dtype=np.float32)
-    child_lookup = {tuple(idx): i for i, idx in enumerate(child_indices)}
+    fine = np.asarray(grid_shape, dtype=np.int64) * refine_factor
+    s = np.floor((colmap_xyz - bound_min) / fine_voxel_size).astype(np.int64)
+    s = np.unique(s[np.all((s >= 0) & (s < fine), axis=1)], axis=0)
+    if len(s) == 0:
+        return np.zeros(len(child_indices), dtype=np.float32)
 
-    # Group surviving free-space children by their coarse parent.
-    child_parent_map = {}
-    for idx in child_indices:
-        parent_idx = tuple((idx // refine_factor).astype(np.int32))
-        child_parent_map.setdefault(parent_idx, []).append(idx)
-
-    # Group fine-resolution COLMAP surface voxels by coarse parent.
-    surface_child = np.floor((colmap_xyz - bound_min) / fine_voxel_size).astype(np.int32)
-    fine_shape = np.asarray(grid_shape, dtype=np.int32) * refine_factor
-    valid = np.all((surface_child >= 0) & (surface_child < fine_shape), axis=1)
-    surface_child = surface_child[valid]
-    surface_child = np.unique(surface_child, axis=0)
-    surface_parent_map = {}
-    for idx in surface_child:
-        parent_idx = tuple((idx // refine_factor).astype(np.int32))
-        surface_parent_map.setdefault(parent_idx, []).append(idx)
-
-    grid_shape = np.asarray(grid_shape, dtype=np.int32)
-
-    for parent in tqdm(refine_parent_voxels, desc="Computing fine child distances"):
-        pmin = np.maximum(np.asarray(parent) - LOCAL_RADIUS, 0)
-        pmax = np.minimum(np.asarray(parent) + LOCAL_RADIUS + 1, grid_shape)
-        local_parent_shape = pmax - pmin
-        local_fine_shape = local_parent_shape * refine_factor
-
-        # Unknown child cells are NOT treated as surfaces. Only actual
-        # fine-resolution COLMAP surface cells form the EDT boundary.
-        local_surface = np.zeros(tuple(local_fine_shape), dtype=bool)
-
-        for px in range(pmin[0], pmax[0]):
-            for py in range(pmin[1], pmax[1]):
-                for pz in range(pmin[2], pmax[2]):
-                    for idx in surface_parent_map.get((px, py, pz), []):
-                        lx = idx[0] - pmin[0] * refine_factor
-                        ly = idx[1] - pmin[1] * refine_factor
-                        lz = idx[2] - pmin[2] * refine_factor
-                        if (0 <= lx < local_fine_shape[0] and 0 <= ly < local_fine_shape[1] and 0 <= lz < local_fine_shape[2]):
-                            local_surface[lx, ly, lz] = True
-
-        # Distance to the nearest surface voxel in world units.
-        local_distance = distance_transform_edt(~local_surface, sampling=fine_voxel_size).astype(np.float32)
-
-        for idx in child_parent_map.get(tuple(parent), []):
-            lx = idx[0] - pmin[0] * refine_factor
-            ly = idx[1] - pmin[1] * refine_factor
-            lz = idx[2] - pmin[2] * refine_factor
-            if (0 <= lx < local_fine_shape[0] and 0 <= ly < local_fine_shape[1] and 0 <= lz < local_fine_shape[2]):
-                child_id = child_lookup[tuple(idx)]
-                child_distance[child_id] = local_distance[lx, ly, lz]
-
-    return child_distance
+    tree = cKDTree(s * fine_voxel_size)
+    dist, _ = tree.query(child_indices * fine_voxel_size, workers=-1)
+    return dist.astype(np.float32)
 
 # ============================================================
-# 10. FIELD GENERATION PIPELINE
+# 11. FIELD GENERATION PIPELINE
 # ============================================================
 def build_free_space_field():
     print("Loading COLMAP points...")
@@ -383,7 +359,17 @@ def build_free_space_field():
     print("PLY points:", len(colmap_xyz))
 
     print("\nBuilding masks...")
-    free_mask, surface_mask, unknown_mask, voxel_indices, voxel_size = build_masks(ray_count, colmap_xyz, bound_min, bound_max)
+    free_mask, surface_mask, unknown_mask, voxel_indices, voxel_size = build_masks(
+        ray_count, colmap_xyz, bound_min, bound_max
+    )
+    
+    margin_mask = np.zeros_like(surface_mask)
+    if SURFACE_MARGIN > 0:
+        margin_mask = binary_dilation(surface_mask, structure=np.ones((3, 3, 3), dtype=bool),
+                                      iterations=SURFACE_MARGIN)
+        free_mask &= ~margin_mask
+        unknown_mask = ~(free_mask | surface_mask)
+        print("Surface margin:", SURFACE_MARGIN, "| voxels removed from free space:", int(margin_mask.sum() - surface_mask.sum()))
 
     print("\nComputing distance field...")
     distance_world, confidence = compute_distance_and_confidence(ray_count, free_mask, voxel_size)
@@ -396,7 +382,7 @@ def build_free_space_field():
 
         print("\nComputing fine child distances...")
         child_distance = compute_child_distances(
-            child_indices, refine_parent_voxels, colmap_xyz, bound_min,s
+            child_indices, refine_parent_voxels, colmap_xyz, bound_min,
             fine_voxel_size, REFINE_FACTOR, grid_resolution
         )
     else:
@@ -405,6 +391,10 @@ def build_free_space_field():
         child_ray_count = np.empty((0,), dtype=np.uint16)
         child_distance = np.empty((0,), dtype=np.float32)
         fine_voxel_size = np.zeros(3, dtype=np.float64)
+
+    if SURFACE_MARGIN > 0 and len(child_indices) > 0:
+        parent = child_indices // REFINE_FACTOR
+        child_distance[margin_mask[parent[:, 0], parent[:, 1], parent[:, 2]]] = 0.0
     print("Maximum child distance:", child_distance.max() if len(child_distance) > 0 else 0.0)
     print("Mean child distance:", child_distance.mean() if len(child_distance) > 0 else 0.0)
 
