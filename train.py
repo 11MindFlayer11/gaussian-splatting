@@ -282,74 +282,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     free_space_bound_max = None
     free_space_grid_resolution = None
 
+    free_space_schedule = {}
+    adaptive_child_indices = None
+    adaptive_child_distance = None
+    adaptive_refine_factor = None
+
+    def load_fs_field(path):
+        nonlocal free_space_distance, free_space_mask, free_space_bound_min, free_space_bound_max, free_space_grid_resolution
+        nonlocal adaptive_child_indices, adaptive_child_distance, adaptive_refine_factor
+        print(f"\n[FreeSpace] Swapping to distance field: {path}")
+        free_data = np.load(path)
+        distance_np = free_data["distance_world"].astype(np.float32)
+        if adaptive_free_space:
+            adaptive_child_indices = torch.from_numpy(free_data["child_indices"].astype(np.int64)).cuda()
+            adaptive_child_distance = torch.from_numpy(free_data["child_distance"].astype(np.float32)).cuda()
+            adaptive_refine_factor = int(free_data["refine_factor"])
+            free_space_grid_resolution = torch.from_numpy(free_data["grid_resolution"].astype(np.int64)).cuda()
+        free_space_distance = torch.from_numpy(distance_np).cuda().permute(2, 1, 0).contiguous()[None, None]
+        free_space_mask = torch.from_numpy(free_data["free_mask"].astype(bool)).cuda()
+        free_space_bound_min = torch.tensor(free_data["bound_min"], device="cuda", dtype=torch.float32)
+        free_space_bound_max = torch.tensor(free_data["bound_max"], device="cuda", dtype=torch.float32)
+
     if free_space_loss:
         if free_space_field_path is None:
-            raise ValueError(
-                "free_space_field_path must be provided when free_space_loss is enabled."
-            )
-
-        free_data = np.load(free_space_field_path)
-
-        distance_np = free_data["distance_world"].astype(np.float32)
-
-        adaptive_child_indices = None
-        adaptive_child_distance = None
-        adaptive_refine_factor = None
-
-        if adaptive_free_space:
-
-            adaptive_child_indices = torch.from_numpy(
-                free_data["child_indices"].astype(np.int64)
-            ).cuda()
-
-            adaptive_child_distance = torch.from_numpy(
-                free_data["child_distance"].astype(np.float32)
-            ).cuda()
-
-            adaptive_refine_factor = int(
-                free_data["refine_factor"]
-            )
-            free_space_grid_resolution = torch.from_numpy(free_data["grid_resolution"].astype(np.int64)).cuda()
-
-            print(
-                "[FreeSpace] Adaptive children:",
-                adaptive_child_indices.shape[0]
-            )
-
-            print(
-                "[FreeSpace] Max child distance:",
-                adaptive_child_distance.max().item()
-                if adaptive_child_distance.numel() > 0
-                else 0.0
-            )
-
-        free_space_distance = torch.from_numpy(distance_np).cuda().permute(2, 1, 0).contiguous()[None, None]
-
-        free_space_mask = torch.from_numpy(
-            free_data["free_mask"].astype(bool)
-        ).cuda()
-
-        free_space_bound_min = torch.tensor(
-            free_data["bound_min"],
-            device="cuda",
-            dtype=torch.float32
-        )
-
-        free_space_bound_max = torch.tensor(
-            free_data["bound_max"],
-            device="cuda",
-            dtype=torch.float32
-        )
-
-        print(
-            "[FreeSpace] Distance field:",
-            tuple(distance_np.shape)
-        )
-
-        print(
-            "[FreeSpace] Max distance:",
-            distance_np.max()
-        )
+            raise ValueError("free_space_field_path must be provided.")
+        
+        if ":" in free_space_field_path:
+            for pair in free_space_field_path.split(","):
+                it, p = pair.split(":")
+                free_space_schedule[int(it)] = p
+        else:
+            free_space_schedule[0] = free_space_field_path
+            
+        load_fs_field(free_space_schedule[min(free_space_schedule.keys())])
 
 
     if args.bounded is not None:
